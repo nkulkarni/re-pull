@@ -49,7 +49,13 @@ class FarmOntarioScraper(Scraper):
 
     @staticmethod
     def clean_text(text) -> str:
-        return re.sub(r"\s+", " ", str(text).strip()) if text else ""
+        """Strip HTML if we were passed a BS4 Tag/ResultSet and normalize whitespace."""
+        if text is None:
+            return ""
+        # BS4 Tag or similar has get_text(); fall back to str()
+        if hasattr(text, "get_text"):
+            text = text.get_text()
+        return re.sub(r"\s+", " ", str(text).strip())
 
     def _extract_coords(self, content: str) -> tuple[Optional[float], Optional[float]]:
         """Improved lat/lng extraction (technique from test.py + fallback).
