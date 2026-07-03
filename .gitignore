@@ -291,6 +291,11 @@ data/
 *_listings_*.csv
 farm_*_listings_*.csv
 
+# Legacy mid-pull checkpoint files (produced by farmontario_midcache.py copy when run from root)
+*farmontario*checkpoint*.jsonl
+*checkpoint*.jsonl
+farmontario_checkpoint.jsonl
+
 # Any local virtual environment created directly in the project root (in addition to the common ones above)
 .venv/
 venv/
