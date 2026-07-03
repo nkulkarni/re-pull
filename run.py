@@ -66,7 +66,8 @@ def run_source(name: str, max_pages: int, use_cache: bool, fresh: bool, out_dir:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="re-pull scraping engine - one command to grow your stable farm data asset"
+        description="re-pull scraping engine - one command to grow your stable farm data asset. "
+                    "If GEOCODIO_API_KEY is set in env, missing lat/long will be geocoded automatically during master update."
     )
     parser.add_argument(
         "sources",

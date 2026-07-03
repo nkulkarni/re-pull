@@ -69,6 +69,11 @@ Index page crawling (for discovering links) still uses fast `requests` + BS4. De
 python run.py                    # Run ALL sources in smart append mode (only new listings)
 python run.py --fresh            # Full refresh of every source
 
+# Geocoding (optional but automatic)
+# Set GEOCODIO_API_KEY=your_key in environment (get free key at geocod.io)
+# Then missing latitude/longitude (e.g. from farmscom) will be filled via Geocodio during master update.
+# Only sources without coords trigger geocoding. Results are cached.
+
 # Specific sources only
 python run.py farmontario
 python run.py farmscom --max-pages 5
@@ -154,10 +159,11 @@ SCRAPERS = {
 - Page cache: `data/cache/`
 - Per-run snapshots (for auditing): `<source>_listings_YYYYMMDD_HHMM.csv`
 - **Your stable growing data asset**: `data/master_listings.csv` (+ .parquet)
-  - Always has latitude/longitude
+  - Always has latitude/longitude (from source if present, else auto-geocoded via Geocodio when `GEOCODIO_API_KEY` is set in env)
   - Always has acres + cost_per_acre (where computable)
   - Deduplicated by detail_url across all sources and runs
   - Append-only by default (the engine only adds what's new)
+  - `geocode_provider` column indicates origin of coordinates (e.g. blank for source-provided, 'geocodio' otherwise)
 
 Never commit scraped data — this repo is for the **scraper code** only.
 

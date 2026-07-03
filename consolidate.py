@@ -10,9 +10,10 @@ Two main modes:
 - update_master()    → the smart "append new stuff only" function used by the engine
 
 The master always has:
-- latitude / longitude columns (NaN if a source didn't provide them)
+- latitude / longitude columns (filled from source if available, else via Geocodio geocoding when coords are missing)
 - acres (parsed from size)
 - cost_per_acre (price_numeric / acres)
+- geocode_provider (e.g. 'geocodio' or NaN if from source)
 
 Usage from the engine:
     python run.py                 # runs all sources in append mode, updates master
@@ -21,11 +22,14 @@ Usage from the engine:
 
 import argparse
 import glob
+import json
 import logging
+import os
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+import requests
 
 from sources.base import parse_acres
 
@@ -78,6 +82,98 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def geocode_missing_coords(df: pd.DataFrame, api_key: str = None) -> pd.DataFrame:
+    """Fill latitude/longitude using Geocodio for rows where they are missing from the source.
+
+    Only geocodes when coords don't exist in the source data.
+    Uses a simple JSON cache (data/geocode_cache.json) to avoid repeated API calls.
+    Adds 'geocode_provider' column for provenance.
+    """
+    if df.empty:
+        return df
+
+    if api_key is None:
+        api_key = os.getenv("GEOCODIO_API_KEY")
+    if not api_key:
+        logger.info("No GEOCODIO_API_KEY found in environment; skipping geocoding.")
+        return df
+
+    # Load cache
+    cache_path = Path("data/geocode_cache.json")
+    cache = {}
+    if cache_path.exists():
+        try:
+            with cache_path.open() as f:
+                cache = json.load(f)
+        except Exception as e:
+            logger.warning("Could not load geocode cache: %s", e)
+
+    # Identify rows needing geocoding (source didn't provide coords)
+    mask = (df.get("latitude").isna() | df.get("longitude").isna())
+    to_geocode = df[mask].copy()
+
+    if to_geocode.empty:
+        logger.info("All rows already have coordinates from source.")
+        return df
+
+    logger.info("Geocoding %d rows with missing coordinates using Geocodio...", len(to_geocode))
+
+    if "geocode_provider" not in df.columns:
+        df["geocode_provider"] = pd.NA
+
+    for idx in to_geocode.index:
+        row = df.loc[idx]
+        # Construct a good query. For legal descriptions, township focus helps.
+        address = str(row.get("address", "")).strip()
+        title = str(row.get("title", "")).strip()
+        province = str(row.get("province", "Ontario")).strip()
+
+        if address:
+            query = f"{address}, {province}, Canada"
+        else:
+            query = f"{title}, {province}, Canada"
+
+        cache_key = query.lower()
+
+        if cache_key in cache:
+            lat, lon = cache[cache_key][:2]
+            df.at[idx, "latitude"] = lat
+            df.at[idx, "longitude"] = lon
+            df.at[idx, "geocode_provider"] = "geocodio (cached)"
+            continue
+
+        try:
+            params = {"q": query, "api_key": api_key}
+            resp = requests.get("https://api.geocod.io/v1.7/geocode", params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("results"):
+                best = data["results"][0]
+                lat = best["location"]["lat"]
+                lon = best["location"]["lng"]
+                # accuracy is a score 0-1 or similar in some responses
+                accuracy = best.get("accuracy", best.get("confidence", None))
+
+                df.at[idx, "latitude"] = lat
+                df.at[idx, "longitude"] = lon
+                df.at[idx, "geocode_provider"] = "geocodio"
+
+                cache[cache_key] = (lat, lon, accuracy)
+                logger.debug("Geocoded: %s -> (%s, %s)", query, lat, lon)
+            else:
+                logger.warning("No results for query: %s", query)
+        except Exception as e:
+            logger.warning("Geocoding failed for '%s': %s", query, e)
+
+    # Save updated cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w") as f:
+        json.dump(cache, f, indent=2)
+
+    logger.info("Geocoding complete. Updated %d rows.", len(to_geocode))
+    return df
+
+
 def deduplicate_listings(df: pd.DataFrame, keep: str = "first") -> pd.DataFrame:
     """Dedup by detail_url. 'first' keeps the earliest scraped_at (stable asset)."""
     if df.empty or "detail_url" not in df.columns:
@@ -99,12 +195,13 @@ def consolidate(
         return Path()
 
     combined = enrich_dataframe(combined)
+    combined = geocode_missing_coords(combined)
     combined = deduplicate_listings(combined, keep="first")
 
     preferred = [
         "title", "price", "price_numeric", "acres", "cost_per_acre",
         "size", "address", "province", "latitude", "longitude",
-        "detail_url", "source", "scraped_at", "source_file"
+        "detail_url", "source", "scraped_at", "geocode_provider", "source_file"
     ]
     cols = [c for c in preferred if c in combined.columns] + [c for c in combined.columns if c not in preferred]
     combined = combined[cols]
@@ -138,6 +235,7 @@ def update_master(
         return master_path
 
     new_listings = enrich_dataframe(new_listings.copy())
+    new_listings = geocode_missing_coords(new_listings)
 
     if master_path.exists():
         try:
@@ -155,7 +253,7 @@ def update_master(
     preferred = [
         "title", "price", "price_numeric", "acres", "cost_per_acre",
         "size", "address", "province", "latitude", "longitude",
-        "detail_url", "source", "scraped_at", "source_file"
+        "detail_url", "source", "scraped_at", "geocode_provider", "source_file"
     ]
     cols = [c for c in preferred if c in combined.columns] + \
            [c for c in combined.columns if c not in preferred]
