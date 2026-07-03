@@ -71,9 +71,7 @@ def main() -> None:
     parser.add_argument(
         "sources",
         nargs="*",
-        default=["all"],
-        choices=list(SCRAPERS.keys()) + ["all"],
-        help="Sources to scrape. Omit or use 'all' to run every registered source.",
+        help="Sources to scrape (e.g. farmontario farmscom). Omit or pass 'all' to run every registered source.",
     )
     parser.add_argument("--max-pages", type=int, default=40, help="Max list pages per source")
     parser.add_argument("--out-dir", default="data", help="Where to write snapshots and the master")
@@ -109,10 +107,11 @@ def main() -> None:
         return
 
     sources_to_run: list[str]
-    if "all" in args.sources or not args.sources:
+    raw = args.sources or ["all"]
+    if "all" in raw:
         sources_to_run = list(SCRAPERS.keys())
     else:
-        sources_to_run = [s for s in args.sources if s in SCRAPERS]
+        sources_to_run = [s for s in raw if s in SCRAPERS]
 
     logging.info("=== re-pull engine starting ===")
     logging.info("Sources: %s | mode: %s", sources_to_run, "FRESH" if args.fresh else "APPEND")
