@@ -29,6 +29,10 @@ def main() -> None:
         "--no-cache", action="store_true",
         help="Disable smart page HTML caching (forces fresh network requests for every detail page)"
     )
+    parser.add_argument(
+        "--consolidate", action="store_true",
+        help="After scraping, also update a consolidated CSV (with acres + cost_per_acre derived)"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -41,6 +45,11 @@ def main() -> None:
         scraper.clear_checkpoint(clear_cache=True)
 
     listings = scraper.crawl()
+
+    # Ensure derived fields (acres, cost_per_acre) are computed even if scraper missed the call
+    for listing in listings:
+        if hasattr(listing, "compute_derived_fields"):
+            listing.compute_derived_fields()
 
     df = pd.DataFrame([listing.to_dict() for listing in listings])
     if df.empty:
@@ -55,6 +64,14 @@ def main() -> None:
     out_path = out_dir / f"{args.source}_listings_{timestamp}.csv"
     df.to_csv(out_path, index=False, encoding="utf-8")
     logging.info("Saved %d listing(s) to %s", len(df), out_path)
+
+    if getattr(args, "consolidate", False):
+        try:
+            from consolidate import consolidate
+            consolidate(data_dir=str(out_dir), output_dir=str(out_dir), output_name="consolidated_farm_listings.csv")
+            logging.info("Also updated consolidated_farm_listings.csv in %s", out_dir)
+        except Exception as e:
+            logging.warning("Consolidation step failed: %s", e)
 
 
 if __name__ == "__main__":

@@ -169,15 +169,31 @@ class FarmOntarioScraper(Scraper):
                 except ValueError:
                     pass
 
+        # Size / acres (farmontario pages often have "50 - 100 Acres" or SizeTotalText)
+        size = ""
+        for txt in soup.find_all(string=re.compile(r"acres|acreage", re.I)):
+            s = self.clean_text(txt)
+            if len(s) < 200 and ("acres" in s.lower() or "acreage" in s.lower()):
+                size = s
+                break
+        # Also try specific fields that appear in the HTML
+        for label in soup.find_all(string=re.compile(r"SizeTotalText|Acreage", re.I)):
+            parent_text = self.clean_text(str(label.parent.get_text() if label.parent else label))
+            if "acres" in parent_text.lower() and len(parent_text) < 150:
+                size = parent_text
+                break
+
         listing = Listing(
             title=self.clean_text(soup.find("h1")),
             price=price_text,
             price_numeric=price_numeric,
+            size=size,
             latitude=lat,
             longitude=lng,
             detail_url=url,
             source=self.name,
         )
+        listing.compute_derived_fields()  # populate acres + cost_per_acre where possible
         self.record(listing)
         logger.info("Scraped %s (%s)", url, listing.price or "no price")
 

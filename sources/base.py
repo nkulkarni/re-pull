@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -22,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Listing:
-    """Common schema all sources normalize into, so outputs can be concatenated."""
+    """Common schema all sources normalize into, so outputs can be concatenated.
+
+    Always includes latitude/longitude (may be None/empty for some sources).
+    acres and cost_per_acre are derived where possible from size and price_numeric.
+    """
 
     title: str = ""
     price: str = ""
@@ -30,6 +35,8 @@ class Listing:
     address: str = ""
     province: str = ""
     size: str = ""
+    acres: Optional[float] = None
+    cost_per_acre: Optional[float] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     detail_url: str = ""
@@ -38,6 +45,34 @@ class Listing:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def compute_derived_fields(self) -> None:
+        """Populate acres (parsed from size string) and cost_per_acre if possible.
+        Call this after setting size/price_numeric in scrapers, or before writing.
+        """
+        if self.acres is None:
+            self.acres = parse_acres(self.size)
+
+        if self.cost_per_acre is None and self.price_numeric and self.acres and self.acres > 0:
+            try:
+                self.cost_per_acre = round(self.price_numeric / self.acres, 2)
+            except Exception:
+                pass
+
+
+def parse_acres(size_text: str) -> Optional[float]:
+    """Robustly extract numeric acres from free-text size (e.g. '410 acres', '205.5 Acres of land')."""
+    if not size_text or not isinstance(size_text, str):
+        return None
+    # Match numbers followed by acres/acre/ac (handles commas and decimals)
+    match = re.search(r'([\d,]+(?:\.\d+)?)\s*(?:acres|acre|ac\b)', size_text, re.IGNORECASE)
+    if match:
+        try:
+            val = match.group(1).replace(',', '')
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 class Scraper(ABC):

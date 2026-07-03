@@ -171,6 +171,7 @@ class FarmsComScraper(Scraper):
             detail_url=url,
             source=self.name,
         )
+        listing.compute_derived_fields()  # sets acres + cost_per_acre
         self.record(listing)
         logger.info("Scraped %s (%s)", url, price or "no price")
 

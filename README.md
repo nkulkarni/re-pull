@@ -75,6 +75,14 @@ python run.py farmontario --max-pages 5 --fresh
 python run.py farmscom --max-pages 2 --fresh
 # (There are ~15 list pages total; use --max-pages 15 for everything)
 
+# After any scrape, also produce a single consolidated file with derived columns
+python run.py farmscom --max-pages 1 --fresh --consolidate
+
+# Or run the standalone consolidator anytime (re-parses acres, computes cost/acre, dedups)
+python consolidate.py
+# Produces data/consolidated_farm_listings.csv (and .parquet) with guaranteed lat/long + cost_per_acre
+
+
 # Limit pages, custom output, force no cache
 python run.py farmontario --max-pages 10 --out-dir data --no-cache
 
@@ -140,7 +148,8 @@ SCRAPERS = {
 - All runtime artifacts go under `data/` (completely ignored by git).
 - Checkpoints (resume state): `data/checkpoints/<source>_checkpoint.jsonl`
 - Smart page cache (raw HTML for speed): `data/cache/<hash>.html`
-- CSVs are written as `<source>_listings_YYYYMMDD_HHMM.csv`.
+- Per-source CSVs: `<source>_listings_YYYYMMDD_HHMM.csv`
+- Consolidated view: `consolidated_farm_listings.csv` (see `python consolidate.py` or `--consolidate` flag)
 
 Never commit scraped data — this repo is for the **scraper code** only.
 
