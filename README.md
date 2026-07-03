@@ -115,6 +115,7 @@ TBD — add your preferred license when publishing.
 ## Notes
 
 - The root `farmontario.py` is the original single-file version before the refactor.
+- `farmontario_midcache.py` is a copy of the above (the original was never modified) that back-ports the mid-pull checkpointing technique from V2. It uses the same append-to-JSONL + restore-on-start approach but stays as a single standalone script. Use it with `python farmontario_midcache.py --fresh --max-pages 10`.
 - Be kind to the sites you scrape (respect robots.txt, use reasonable delays, etc.).
 - This is intended as an internal/research tool.
 
