@@ -65,22 +65,26 @@ Index page crawling (for discovering links) still uses fast `requests` + BS4. De
 ## Usage
 
 ```bash
-# Basic run (uses smart cache + checkpoint resume by default)
+# The engine - one command to rule them all
+python run.py                    # Run ALL sources in smart append mode (only new listings)
+python run.py --fresh            # Full refresh of every source
+
+# Specific sources only
 python run.py farmontario
+python run.py farmscom --max-pages 5
 
-# Small test run (recommended first)
-python run.py farmontario --max-pages 5 --fresh
+# The master asset (your growing, stable data) is automatically maintained at:
+#   data/master_listings.csv          (and .parquet if pyarrow is installed)
+#
+# It always contains:
+#   - latitude / longitude (empty/NaN where a source couldn't extract them)
+#   - acres + cost_per_acre (computed from size + price where possible)
 
-# New source: farms.com Ontario listings (uses same V2 Playwright + cache)
-python run.py farmscom --max-pages 2 --fresh
-# (There are ~15 list pages total; use --max-pages 15 for everything)
-
-# After any scrape, also produce a single consolidated file with derived columns
-python run.py farmscom --max-pages 1 --fresh --consolidate
-
-# Or run the standalone consolidator anytime (re-parses acres, computes cost/acre, dedups)
+# Occasional full rebuild of the master from all snapshots (rarely needed)
 python consolidate.py
-# Produces data/consolidated_farm_listings.csv (and .parquet) with guaranteed lat/long + cost_per_acre
+
+# Just rebuild the master without scraping
+python run.py --master-only
 
 
 # Limit pages, custom output, force no cache
@@ -146,10 +150,14 @@ SCRAPERS = {
 ## Data & checkpoints
 
 - All runtime artifacts go under `data/` (completely ignored by git).
-- Checkpoints (resume state): `data/checkpoints/<source>_checkpoint.jsonl`
-- Smart page cache (raw HTML for speed): `data/cache/<hash>.html`
-- Per-source CSVs: `<source>_listings_YYYYMMDD_HHMM.csv`
-- Consolidated view: `consolidated_farm_listings.csv` (see `python consolidate.py` or `--consolidate` flag)
+- Checkpoints per source: `data/checkpoints/<source>_checkpoint.jsonl`
+- Page cache: `data/cache/`
+- Per-run snapshots (for auditing): `<source>_listings_YYYYMMDD_HHMM.csv`
+- **Your stable growing data asset**: `data/master_listings.csv` (+ .parquet)
+  - Always has latitude/longitude
+  - Always has acres + cost_per_acre (where computable)
+  - Deduplicated by detail_url across all sources and runs
+  - Append-only by default (the engine only adds what's new)
 
 Never commit scraped data — this repo is for the **scraper code** only.
 
