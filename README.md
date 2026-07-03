@@ -69,27 +69,53 @@ Index page crawling (for discovering links) still uses fast `requests` + BS4. De
 python run.py                    # Run ALL sources in smart append mode (only new listings)
 python run.py --fresh            # Full refresh of every source
 
-# Geocoding (optional but automatic)
-# Set GEOCODIO_API_KEY=your_key in environment (get free key at geocod.io)
-# Then missing latitude/longitude (e.g. from farmscom) will be filled via Geocodio during master update.
-# Only sources without coords trigger geocoding. Results are cached.
-
 # Specific sources only
 python run.py farmontario
 python run.py farmscom --max-pages 5
-
-# The master asset (your growing, stable data) is automatically maintained at:
-#   data/master_listings.csv          (and .parquet if pyarrow is installed)
-#
-# It always contains:
-#   - latitude / longitude (empty/NaN where a source couldn't extract them)
-#   - acres + cost_per_acre (computed from size + price where possible)
 
 # Occasional full rebuild of the master from all snapshots (rarely needed)
 python consolidate.py
 
 # Just rebuild the master without scraping
 python run.py --master-only
+```
+
+## Geocoding
+
+The engine automatically fills in missing `latitude` / `longitude` for sources that don't provide them (e.g. farms.com listings often lack them, while farmontario embeds them from their map data).
+
+### How it works
+- Triggered **only** for rows where `latitude` or `longitude` is missing/NaN from the *source* data.
+- Uses **Geocodio** (excellent for Canadian addresses, especially rural Ontario).
+- Requires `GEOCODIO_API_KEY` in your environment (free tier: 2,500 requests/day — sign up at [geocod.io](https://www.geocod.io/)).
+- **Persistent cache** at `data/geocode_cache.json` — addresses are only geocoded once (even across runs).
+- Adds `geocode_provider` column to the master (e.g. `geocodio` or `geocodio (cached)`).
+- Runs automatically during:
+  - `python run.py` (append mode)
+  - `python run.py --fresh`
+  - `python run.py --master-only` (via full consolidate)
+  - Manual `python consolidate.py`
+
+### Usage
+```bash
+export GEOCODIO_API_KEY=your_key_here
+
+# Geocoding happens automatically on next run for any missing coords
+python run.py farmscom --max-pages 2
+```
+
+### Master columns (always present)
+- `latitude`, `longitude` — filled from source or Geocodio
+- `geocode_provider` — provenance (`geocodio` etc.)
+- `acres`, `cost_per_acre` — derived where possible
+
+**Note on farm legal descriptions**: Ontario listings often use "Lot X Concession Y, Township" format. Geocodio will typically resolve these to the township or road area (not exact parcel centroid). This is expected behavior for address-based geocoding and is still very useful for mapping/analysis. For exact parcel data you'd need Ontario land registry/parcel fabric access.
+
+### Switching providers
+The geocoding logic lives in `geocode_missing_coords()` inside `consolidate.py`. It's easy to swap in Nominatim, OpenCage, Google, etc. (the function is designed for that).
+
+### Without an API key
+If `GEOCODIO_API_KEY` is not set, geocoding is silently skipped. You still get a clean master with whatever coordinates the sources themselves provide (lat/long columns are always present, even if empty).
 
 
 # Limit pages, custom output, force no cache
@@ -159,11 +185,11 @@ SCRAPERS = {
 - Page cache: `data/cache/`
 - Per-run snapshots (for auditing): `<source>_listings_YYYYMMDD_HHMM.csv`
 - **Your stable growing data asset**: `data/master_listings.csv` (+ .parquet)
-  - Always has latitude/longitude (from source if present, else auto-geocoded via Geocodio when `GEOCODIO_API_KEY` is set in env)
-  - Always has acres + cost_per_acre (where computable)
-  - Deduplicated by detail_url across all sources and runs
+  - Always has latitude/longitude (from source if present, else auto-filled via Geocodio when `GEOCODIO_API_KEY` env var is set)
+  - Always has `acres` + `cost_per_acre` (derived where possible)
+  - `geocode_provider` column for provenance
+  - Deduplicated by `detail_url` across all sources and historical runs
   - Append-only by default (the engine only adds what's new)
-  - `geocode_provider` column indicates origin of coordinates (e.g. blank for source-provided, 'geocodio' otherwise)
 
 Never commit scraped data — this repo is for the **scraper code** only.
 
