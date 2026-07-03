@@ -20,15 +20,23 @@ def main() -> None:
     parser.add_argument("--max-pages", type=int, default=40)
     parser.add_argument("--out-dir", default="data")
     parser.add_argument(
-        "--fresh", action="store_true", help="Ignore any existing checkpoint and start over"
+        "--fresh", action="store_true",
+        help="Ignore checkpoint + clear page cache and start over (recommended for full re-pull)"
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable smart page HTML caching (forces fresh network requests for every detail page)"
     )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    scraper = SCRAPERS[args.source](max_pages=args.max_pages)
+    scraper = SCRAPERS[args.source](
+        max_pages=args.max_pages,
+        use_cache=not args.no_cache
+    )
     if args.fresh:
-        scraper.clear_checkpoint()
+        scraper.clear_checkpoint(clear_cache=True)
 
     listings = scraper.crawl()
 

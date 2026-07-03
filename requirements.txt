@@ -1,7 +1,12 @@
 # Direct runtime dependencies for re-pull
 beautifulsoup4>=4.12
 pandas>=2.0
+playwright>=1.40
 requests>=2.31
 
 # The above will pull in transitive deps (numpy, soupsieve, urllib3, etc.).
 # For exact reproducibility you can pin more tightly or use pip-tools / poetry.
+#
+# After pip install, you MUST run:
+#   playwright install chromium
+# (or just `playwright install`) to download the browser binaries (~150MB).
