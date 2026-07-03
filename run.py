@@ -1,0 +1,51 @@
+import argparse
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+from sources.farmontario import FarmOntarioScraper
+
+# Register each new source scraper here — everything else (checkpointing,
+# CLI, output) works automatically once it's added to this mapping.
+SCRAPERS = {
+    "farmontario": FarmOntarioScraper,
+}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Canadian farm listings scraper")
+    parser.add_argument("source", choices=SCRAPERS.keys())
+    parser.add_argument("--max-pages", type=int, default=40)
+    parser.add_argument("--out-dir", default="data")
+    parser.add_argument(
+        "--fresh", action="store_true", help="Ignore any existing checkpoint and start over"
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    scraper = SCRAPERS[args.source](max_pages=args.max_pages)
+    if args.fresh:
+        scraper.clear_checkpoint()
+
+    listings = scraper.crawl()
+
+    df = pd.DataFrame([listing.to_dict() for listing in listings])
+    if df.empty:
+        logging.info("No listings found.")
+        return
+
+    df = df.drop_duplicates(subset=["detail_url"])
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    out_path = out_dir / f"{args.source}_listings_{timestamp}.csv"
+    df.to_csv(out_path, index=False, encoding="utf-8")
+    logging.info("Saved %d listing(s) to %s", len(df), out_path)
+
+
+if __name__ == "__main__":
+    main()
