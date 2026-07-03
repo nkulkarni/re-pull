@@ -71,6 +71,10 @@ python run.py farmontario
 # Small test run (recommended first)
 python run.py farmontario --max-pages 5 --fresh
 
+# New source: farms.com Ontario listings (uses same V2 Playwright + cache)
+python run.py farmscom --max-pages 2 --fresh
+# (There are ~15 list pages total; use --max-pages 15 for everything)
+
 # Limit pages, custom output, force no cache
 python run.py farmontario --max-pages 10 --out-dir data --no-cache
 

@@ -6,11 +6,13 @@ from pathlib import Path
 import pandas as pd
 
 from sources.farmontario import FarmOntarioScraper
+from sources.farmscom import FarmsComScraper
 
 # Register each new source scraper here — everything else (checkpointing,
 # CLI, output) works automatically once it's added to this mapping.
 SCRAPERS = {
     "farmontario": FarmOntarioScraper,
+    "farmscom": FarmsComScraper,
 }
 
 
