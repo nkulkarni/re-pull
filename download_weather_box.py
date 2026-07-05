@@ -8,17 +8,17 @@ This script:
    point with generous maxStations and maxDistance settings.
 2. Filters the stations to those strictly inside the box.
 3. Downloads the "area" historical weather data (blended from stations in/near the box)
-   for the requested date range, chunked by year to respect API limits.
+   for the requested date range, chunked (e.g. by month for hourly data) to respect API limits.
 4. Attempts to download raw historical observations for each individual station in the box
    (using the station ID as location where supported by the API).
 5. Saves everything as CSV files for easy analysis:
    - stations_in_box.csv : list of stations with coords, names, distances
-   - area_weather_YYYY.csv : the main weather data for the box (daily by default)
-   - station_<id>_data.csv : per-station historical data (if available)
+   - area_weather_hourly_YYYY-MM.csv : the main weather data for the box (hourly)
+   - station_<id>_hourly_data.csv : per-station historical data (if available)
 
-" All available historical" is handled by chunking (e.g. year-by-year). 
-Full 50+ years will generate a lot of data and may hit your plan's row limits or rate limits.
-Start with a small date range (e.g. last 2-5 years) and scale up.
+" All available historical" is handled by chunking (e.g. monthly for hourly). 
+Full 50+ years of *hourly* data will generate enormous files and will almost certainly hit your plan's row limits or rate limits.
+Start with a small date range (e.g. last 1-3 years or even a few months) and scale up carefully. Hourly data is 24x larger than daily.
 
 Requirements:
 - requests (already in project requirements.txt)
@@ -27,15 +27,17 @@ Requirements:
 
 Usage examples:
     python download_weather_box.py
-    python download_weather_box.py --start 2020-01-01 --end 2023-12-31
+    python download_weather_box.py --start 2023-01-01 --end 2023-03-31   # small test range for hourly
     python download_weather_box.py --lat-min 42.0 --lat-max 44.5 --lon-min -82.5 --lon-max -79.0
 
 The script uses metric units by default. Change unitGroup if needed.
+Hourly data is requested by default (include=hours,obs,stations).
 
 Note on "weather station data":
 Visual Crossing primarily returns high-quality interpolated/blended data from the nearest
 stations (obs + remote sources). The response includes which stations contributed.
 We also try to pull per-station observations where the station ID can be used as a location.
+Hourly data is requested (this matches your request for hour-level, not daily).
 This gives you the closest thing to "all station data in the box".
 """
 
@@ -154,13 +156,15 @@ def fetch_timeline_chunk(api_key, location, start_date, end_date, include="days,
     resp.raise_for_status()
     return resp.json()
 
-def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=365,
-                               include="days,obs,stations", unit_group="metric"):
+def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=30,
+                               include="hours,obs,stations", unit_group="metric"):
     """
     Download historical data in time chunks to avoid row limits.
-    Returns list of day records + the stations dict from the last successful response.
+    Defaults to hourly data (include=hours,obs,stations) and smaller chunks.
+    Collects hourly records from the nested 'hours' arrays inside each 'day'.
+    Returns list of hourly records + the stations dict from the last successful response.
     """
-    all_days = []
+    all_records = []  # will hold hourly records
     last_stations = {}
 
     current = datetime.fromisoformat(start_date)
@@ -176,19 +180,26 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
                 api_key, location, date1, date2, include=include, unit_group=unit_group
             )
             days = data.get("days", [])
-            all_days.extend(days)
+            chunk_count = 0
+            for day in days:
+                hours = day.get("hours", [])
+                for hour in hours:
+                    # Optionally attach the day's date or other metadata
+                    hour["day"] = day.get("datetime")
+                    all_records.append(hour)
+                    chunk_count += 1
             if "stations" in data:
                 last_stations = data["stations"]
-            logger.info(f"  Got {len(days)} day records for {date1}–{date2}")
+            logger.info(f"  Got {chunk_count} hourly records for {date1}–{date2}")
         except Exception as e:
             logger.error(f"  Failed chunk {date1}–{date2}: {e}")
             # Continue with next chunk
 
         current = chunk_end + timedelta(days=1)
-        # Be nice to the API
-        time.sleep(0.5)
+        # Be nice to the API (important for hourly which returns more data)
+        time.sleep(1)
 
-    return all_days, last_stations
+    return all_records, last_stations
 
 def main():
     parser = argparse.ArgumentParser(description="Download historical weather station data for a lat/lon box using Visual Crossing.")
@@ -198,7 +209,7 @@ def main():
     parser.add_argument("--lon-max", type=float, default=-79.0, help="Maximum longitude of box")
     parser.add_argument("--start", default="2020-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default="2024-12-31", help="End date YYYY-MM-DD")
-    parser.add_argument("--chunk-days", type=int, default=365, help="Days per API chunk (reduce if you hit row limits)")
+    parser.add_argument("--chunk-days", type=int, default=14, help="Days per API chunk. For hourly data use small values like 7-30 to avoid row limits (default 14 for hourly)")
     parser.add_argument("--output-dir", default="weather_data", help="Directory to save CSVs")
     parser.add_argument("--unit-group", default="metric", choices=["us", "uk", "metric", "base"])
     args = parser.parse_args()
@@ -231,15 +242,15 @@ def main():
     # 2. Download the main "area" historical data (blended from stations near the box)
     location = f"{center_lat},{center_lon}"
     print(f"\nDownloading area weather data for representative location {location} ...")
-    days_data, last_stations = download_historical_chunks(
+    records, last_stations = download_historical_chunks(
         api_key, location, args.start, args.end,
         chunk_days=args.chunk_days,
-        include="days,obs,stations",
+        include="hours,obs,stations",
         unit_group=args.unit_group
     )
 
-    if days_data:
-        area_df = pd.DataFrame(days_data)
+    if records:
+        area_df = pd.DataFrame(records)
         # Add some metadata
         area_df["query_center_lat"] = center_lat
         area_df["query_center_lon"] = center_lon
@@ -248,12 +259,12 @@ def main():
         area_df["box_lon_min"] = args.lon_min
         area_df["box_lon_max"] = args.lon_max
 
-        # Save per year for manageability, or one file
-        area_df["year"] = pd.to_datetime(area_df["datetime"]).dt.year
-        for year, group in area_df.groupby("year"):
-            year_path = output_dir / f"area_weather_{year}.csv"
-            group.drop(columns=["year"]).to_csv(year_path, index=False)
-            print(f"  Saved {len(group)} rows for {year} -> {year_path}")
+        # Save per month for manageability with hourly data (very large files)
+        area_df["year_month"] = pd.to_datetime(area_df["datetime"]).dt.strftime("%Y-%m")
+        for ym, group in area_df.groupby("year_month"):
+            ym_path = output_dir / f"area_weather_hourly_{ym}.csv"
+            group.drop(columns=["year_month"]).to_csv(ym_path, index=False)
+            print(f"  Saved {len(group)} hourly rows for {ym} -> {ym_path}")
 
         # Also save the stations that were used in the queries
         if last_stations:
@@ -274,7 +285,7 @@ def main():
                 station_days, _ = download_historical_chunks(
                     api_key, sid, args.start, args.end,
                     chunk_days=args.chunk_days,
-                    include="days,obs",
+                    include="hours,obs",
                     unit_group=args.unit_group
                 )
                 if station_days:
@@ -283,9 +294,9 @@ def main():
                     sdf["station_name"] = station.get("name", "")
                     sdf["station_lat"] = station["latitude"]
                     sdf["station_lon"] = station["longitude"]
-                    sfile = output_dir / f"station_{sid}_data.csv"
+                    sfile = output_dir / f"station_{sid}_hourly_data.csv"
                     sdf.to_csv(sfile, index=False)
-                    print(f"  Saved {len(sdf)} rows for station {sid} -> {sfile}")
+                    print(f"  Saved {len(sdf)} hourly rows for station {sid} -> {sfile}")
                 else:
                     print(f"  No data for station {sid} (may not support direct station queries or no data in range)")
             except Exception as e:
@@ -294,8 +305,8 @@ def main():
 
     print("\n=== Demo complete ===")
     print(f"Check the '{output_dir}' directory for CSVs.")
-    print("The 'area_weather_*.csv' files contain the main historical records based on stations in/near your box.")
-    print("The per-station files (if any) contain more direct station observations.")
+    print("The 'area_weather_hourly_*.csv' files contain the main historical *hourly* records based on stations in/near your box.")
+    print("The per-station files (if any) contain more direct station hourly observations.")
 
 if __name__ == "__main__":
     main()
