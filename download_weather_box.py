@@ -236,7 +236,7 @@ def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours
 def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=None,
                                include="hours,obs,stations", unit_group="metric",
                                output_dir: Path = None, resolution_label="hourly",
-                               is_paid=False):
+                               is_paid=False, cache=None, box_key=None, file_prefix="area_weather"):
     """
     Smart, automatic chunking for large time periods.
     Non-technical users should not have to think about chunk sizes.
@@ -245,6 +245,7 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
     - Paid users get significantly larger chunks (faster, fewer calls).
     - Breaks the full requested range into small safe API calls.
     - **Resumable**: Skips any monthly output file that already exists and has data (great if run is interrupted).
+      Also checks the central cache in data/weather_pulls_cache.json .
     - Good logging so users see progress.
     - Returns the collected records + last stations info.
     """
@@ -282,18 +283,28 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
         date2 = chunk_end.strftime("%Y-%m-%d")
         chunk_num += 1
 
-        # --- RESUMABILITY: check for existing monthly file(s) ---
+        # Compute the periods this chunk covers (for hourly, year-month)
+        year_months = set()
+        d = current
+        while d <= chunk_end:
+            year_months.add(d.strftime("%Y-%m"))
+            d += timedelta(days=1)
+
+        # --- RESUMABILITY: check for existing monthly file(s) OR central cache ---
+        skip = False
         if output_dir:
-            year_months = set()
-            d = current
-            while d <= chunk_end:
-                year_months.add(d.strftime("%Y-%m"))
-                d += timedelta(days=1)
-            existing = any((output_dir / f"area_weather_{resolution_label}_{ym}.csv").exists() for ym in year_months)
+            existing = any((output_dir / f"{file_prefix}_{resolution_label}_{ym}.csv").exists() for ym in year_months)
             if existing:
-                logger.info(f"[{chunk_num}/{approx_chunks}] Skipping {date1}–{date2} (output files already exist)")
-                current = chunk_end + timedelta(days=1)
-                continue
+                skip = True
+        if not skip and cache and box_key:
+            box_cache = cache.get("boxes", {}).get(box_key, {}).get(resolution_label, {})
+            if all(box_cache.get(ym, {}).get("pulled") for ym in year_months):
+                skip = True
+
+        if skip:
+            logger.info(f"[{chunk_num}/{approx_chunks}] Skipping {date1}–{date2} (already pulled per cache or output files)")
+            current = chunk_end + timedelta(days=1)
+            continue
 
         try:
             data = fetch_timeline_chunk(
@@ -377,6 +388,23 @@ def main():
     except Exception:
         days = 0
         start_dt = end_dt = None
+
+    # Load or init the pulled cache in ./data (for knowing what has already been pulled, for future "diff" / resume across runs)
+    cache_path = Path("data") / "weather_pulls_cache.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    box_key = f"{args.lat_min:.4f}_{args.lat_max:.4f}_{args.lon_min:.4f}_{args.lon_max:.4f}"
+    try:
+        if cache_path.exists():
+            with cache_path.open() as f:
+                cache = json.load(f)
+        else:
+            cache = {"boxes": {}}
+    except Exception:
+        cache = {"boxes": {}}
+    if box_key not in cache["boxes"]:
+        cache["boxes"][box_key] = {}
+    if res_label not in cache["boxes"][box_key]:
+        cache["boxes"][box_key][res_label] = {}
 
     # Cost estimate using the helper (preliminary, assumes ~5 stations)
     if days > 0:
@@ -522,7 +550,10 @@ def main():
         unit_group=args.unit_group,
         output_dir=output_dir,
         resolution_label=res_label,
-        is_paid=(args.plan == "paid")
+        is_paid=(args.plan == "paid"),
+        cache=cache,
+        box_key=box_key,
+        file_prefix="area_weather"
     )
 
     if records:
@@ -537,10 +568,24 @@ def main():
 
         # Save per month for manageability with hourly data (very large files)
         area_df["year_month"] = pd.to_datetime(area_df["datetime"]).dt.strftime("%Y-%m")
+        pulled_periods = []
         for ym, group in area_df.groupby("year_month"):
             ym_path = output_dir / f"area_weather_{res_label}_{ym}.csv"
             group.drop(columns=["year_month"]).to_csv(ym_path, index=False)
             print(f"  Saved {len(group)} {res_label} rows for {ym} -> {ym_path}")
+            pulled_periods.append(ym)
+
+            # Update central cache
+            if box_key not in cache["boxes"]:
+                cache["boxes"][box_key] = {}
+            if res_label not in cache["boxes"][box_key]:
+                cache["boxes"][box_key][res_label] = {}
+            cache["boxes"][box_key][res_label][ym] = {
+                "pulled": True,
+                "pulled_at": datetime.now().isoformat(),
+                "records": len(group),
+                "file": str(ym_path)
+            }
 
         # Also save the stations that were used in the queries
         if last_stations:
@@ -548,6 +593,13 @@ def main():
             used_path = output_dir / "stations_used_in_area_queries.csv"
             used_df.to_csv(used_path, index=False)
             print(f"  Saved stations used in area queries -> {used_path}")
+
+        # Persist cache after area data
+        try:
+            with cache_path.open("w") as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save weather cache: {e}")
     else:
         print("No area weather data retrieved.")
 
@@ -559,14 +611,20 @@ def main():
             try:
                 # Many station IDs (especially ICAO or the numeric ones) work as location values
                 station_include = "hours,obs" if args.resolution == "hourly" else "days,obs"
-                station_days, _ = download_historical_chunks(
+                sfile_expected = output_dir / f"station_{sid}_{res_label}_data.csv"
+            if sfile_expected.exists() and sfile_expected.stat().st_size > 0:
+                print(f"  Skipping station {sid} (output file already exists)")
+                continue
+            station_days, _ = download_historical_chunks(
                     api_key, sid, args.start, args.end,
                     chunk_days=args.chunk_days,
                     include=station_include,
                     unit_group=args.unit_group,
                     output_dir=output_dir,
                     resolution_label=args.resolution,
-                    is_paid=(args.plan == "paid")
+                    is_paid=(args.plan == "paid"),
+                    cache=cache,
+                    box_key=box_key  # reuse box key, or could key per station
                 )
                 if station_days:
                     sdf = pd.DataFrame(station_days)
@@ -577,11 +635,38 @@ def main():
                     sfile = output_dir / f"station_{sid}_{res_label}_data.csv"
                     sdf.to_csv(sfile, index=False)
                     print(f"  Saved {len(sdf)} {res_label} rows for station {sid} -> {sfile}")
+
+                    # Update cache for per-station pull (record the full requested range for this station)
+                    if "stations" not in cache["boxes"][box_key][res_label]:
+                        cache["boxes"][box_key][res_label]["stations"] = {}
+                    if sid not in cache["boxes"][box_key][res_label]["stations"]:
+                        cache["boxes"][box_key][res_label]["stations"][sid] = {}
+                    station_period_key = f"{args.start}_{args.end}"
+                    cache["boxes"][box_key][res_label]["stations"][sid][station_period_key] = {
+                        "pulled": True,
+                        "pulled_at": datetime.now().isoformat(),
+                        "records": len(sdf),
+                        "file": str(sfile)
+                    }
                 else:
                     print(f"  No data for station {sid} (may not support direct station queries or no data in range)")
             except Exception as e:
                 print(f"  Could not fetch direct data for station {sid}: {e}")
                 # This is common; many stations are only accessible via the blended query.
+
+        # Persist cache after per-station data too
+        try:
+            with cache_path.open("w") as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save weather cache: {e}")
+
+    # Always try to persist cache at end
+    try:
+        with cache_path.open("w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save weather cache: {e}")
 
     print("\n=== Demo complete ===")
     print(f"Check the '{output_dir}' directory for CSVs.")
@@ -597,11 +682,18 @@ def main():
         summary_path = output_dir / "download_summary.txt"
         with summary_path.open("w") as f:
             f.write(f"Download completed: {datetime.now().isoformat()}\n")
-            f.write(f"Box: lat {args.lat_min}-{args.lat_max}, lon {args.lon_min}-{args.lon_max}\n")
-            f.write(f"Requested: {args.start} to {args.end} ({args.resolution})\n")
+            f.write(f"Box: lat {args.lat_min} to {args.lat_max}, lon {args.lon_min} to {args.lon_max}\n")
+            f.write(f"Requested date range: {args.start} to {args.end}\n")
+            f.write(f"Resolution: {args.resolution}\n")
             f.write(f"Plan: {args.plan}\n")
+            if 'pulled_periods' in locals() and pulled_periods:
+                f.write(f"Periods newly pulled in this run: {', '.join(sorted(pulled_periods))}\n")
+            else:
+                f.write("Periods pulled in this run: (resumed from cache/files; see output files)\n")
             f.write(f"Total records downloaded this run: {len(records) if 'records' in locals() else 'N/A'}\n")
+            f.write(f"Stations in/near box: {len(stations) if 'stations' in locals() else 'N/A'}\n")
             f.write("Files created are safe to open in Excel or Google Sheets.\n")
+            f.write("Central cache of what has already been pulled (for future diff/resume): data/weather_pulls_cache.json\n")
         print(f"Summary written to {summary_path}")
     except Exception:
         pass
