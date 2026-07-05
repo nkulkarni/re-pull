@@ -60,6 +60,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,18 +115,40 @@ def estimate_records_and_cost(days, num_stations, resolution, is_paid):
         'est_billable_cost': billable_cost
     }
 
+
+def filter_stations_by_box(all_stations, lat_min, lat_max, lon_min, lon_max, max_dist_outside):
+    """Return stations inside box or within max_dist_outside meters of it."""
+    def station_is_acceptable(s):
+        slat = s["latitude"]
+        slon = s["longitude"]
+        if lat_min <= slat <= lat_max and lon_min <= slon <= lon_max:
+            return True, 0.0
+        closest_lat = max(lat_min, min(slat, lat_max))
+        closest_lon = max(lon_min, min(slon, lon_max))
+        dist = haversine_distance(slat, slon, closest_lat, closest_lon)
+        return (dist <= max_dist_outside), dist
+
+    acceptable = []
+    for s in all_stations:
+        ok, dist = station_is_acceptable(s)
+        s = s.copy()
+        s["distance_to_box_m"] = round(dist) if dist is not None else 999999
+        if ok:
+            acceptable.append(s)
+    return acceptable
+
 def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
                              max_distance=None, max_stations=None, sample_date="2024-07-01",
-                             station_search_radius=50000, max_station_distance_from_box=0):
+                             station_search_radius=50000):
     """
     Discover weather stations around the box by querying the center point with
-    large max* settings. Then filter to stations inside the box.
+    large max* settings. Returns the list of stations found in the search radius.
+    Filtering by box + buffer happens in main() so we can prompt interactively.
     """
     center_lat = (lat_min + lat_max) / 2
     center_lon = (lon_min + lon_max) / 2
     location = f"{center_lat},{center_lon}"
 
-    # Sensible defaults that work on free plans; paid users can go much higher
     if max_distance is None:
         max_distance = station_search_radius or 150000   # 150 km
     if max_stations is None:
@@ -139,7 +162,7 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
         "maxStations": max_stations,
         "unitGroup": "metric",
         "contentType": "json",
-        "options": "collectStationContributions",  # helps get contribution info
+        "options": "collectStationContributions",
     }
 
     logger.info(f"Discovering stations near center {center_lat:.4f},{center_lon:.4f} "
@@ -163,44 +186,10 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
             "longitude": slon,
             "distance_m": round(distance),
             "elevation": sinfo.get("elevation"),
-            "contribution": sinfo.get("contribution", 100),  # percentage in some responses
+            "contribution": sinfo.get("contribution", 100),
         })
 
-    # Filter: stations strictly inside box OR within max_station_distance_from_box of the box
-    # (user can set this via --max-station-distance-from-box to pull nearby stations for tiny boxes)
-    def station_is_acceptable(s, lat_min, lat_max, lon_min, lon_max, max_dist_outside):
-        slat = s["latitude"]
-        slon = s["longitude"]
-        # Strictly inside?
-        if lat_min <= slat <= lat_max and lon_min <= slon <= lon_max:
-            return True, 0.0
-        # Always compute distance to closest point in the box (clamped)
-        closest_lat = max(lat_min, min(slat, lat_max))
-        closest_lon = max(lon_min, min(slon, lon_max))
-        dist = haversine_distance(slat, slon, closest_lat, closest_lon)
-        if max_dist_outside <= 0:
-            return False, dist
-        return dist <= max_dist_outside, dist
-
-    acceptable_stations = []
-    for s in all_stations:
-        ok, dist = station_is_acceptable(
-            s, lat_min, lat_max, lon_min, lon_max, max_station_distance_from_box
-        )
-        s = s.copy()
-        s["distance_to_box_m"] = round(dist) if dist is not None else 999999
-        if ok:
-            acceptable_stations.append(s)
-
-    logger.info(f"Discovered {len(all_stations)} stations in search radius; "
-                f"{len(acceptable_stations)} inside or within {max_station_distance_from_box}m of the box.")
-    if len(acceptable_stations) == 0 and len(all_stations) > 0:
-        # Find closest for helpful message
-        closest = min(all_stations, key=lambda s: s.get("distance_to_box_m", 999999))
-        dist = closest.get('distance_to_box_m', 2000)
-        logger.info(f"Closest station is {dist} meters ({dist/1000:.1f} km) from the box. "
-                    f"Try --max-station-distance-from-box {dist + 500} (or round to 2000 for 2 km) or higher.")
-    return acceptable_stations
+    return all_stations
 
 def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours,obs,stations",
                          unit_group="metric", extra_params=None, max_retries=5):
@@ -380,19 +369,26 @@ def main():
     # Make resolution label available for later prints and filenames even if some blocks are skipped
     res_label = "hourly" if args.resolution == "hourly" else "daily"
 
-    # Cost estimate using the helper (preliminary, assumes ~5 stations)
+    # Compute days early for estimates and interactive
     try:
         start_dt = datetime.fromisoformat(args.start)
         end_dt = datetime.fromisoformat(args.end)
         days = (end_dt - start_dt).days + 1
-        est = estimate_records_and_cost(days, 5, args.resolution, args.plan == "paid")
-        print("Preliminary cost estimate (before exact # of stations):")
-        print(f"  ~{est['hours']:,} hours → ~{est['total']:,} records (area + ~5 stations)")
-        print(f"  Rough total cost: ${est['est_total_cost']:.2f}")
-        print(f"  After daily free allowance (~{1000*days:,} records): ~${est['est_billable_cost']:.2f}")
-        print(f"  (Will refine after discovering actual stations in the box.)\n")
     except Exception:
-        pass
+        days = 0
+        start_dt = end_dt = None
+
+    # Cost estimate using the helper (preliminary, assumes ~5 stations)
+    if days > 0:
+        try:
+            est = estimate_records_and_cost(days, 5, args.resolution, args.plan == "paid")
+            print("Preliminary cost estimate (before exact # of stations):")
+            print(f"  ~{est['hours']:,} hours → ~{est['total']:,} records (area + ~5 stations)")
+            print(f"  Rough total cost: ${est['est_total_cost']:.2f}")
+            print(f"  After daily free allowance (~{1000*days:,} records): ~${est['est_billable_cost']:.2f}")
+            print(f"  (Will refine after discovering actual stations in the box.)\n")
+        except Exception:
+            pass
 
     # Friendly warning for non-technical users doing big pulls
     try:
@@ -424,12 +420,16 @@ def main():
         default_max_distance = 150000
 
     effective_search_radius = args.station_search_radius or default_max_distance
-    stations = discover_stations_in_box(
+    candidates = discover_stations_in_box(
         api_key, args.lat_min, args.lat_max, args.lon_min, args.lon_max,
         max_distance=effective_search_radius,
-        max_stations=args.max_stations or default_max_stations,
-        max_station_distance_from_box=args.max_station_distance_from_box,
-        station_search_radius=args.station_search_radius
+        max_stations=args.max_stations or default_max_stations
+    )
+
+    # Filter with current value (may be 0)
+    stations = filter_stations_by_box(
+        candidates, args.lat_min, args.lat_max, args.lon_min, args.lon_max,
+        args.max_station_distance_from_box
     )
 
     if stations:
@@ -461,7 +461,46 @@ def main():
         print("The number for --max-station-distance-from-box is in METERS.")
         print("   Example: --max-station-distance-from-box 2000   means allow stations up to 2000 meters (2 km) outside the box.")
         print("You can also increase --station-search-radius (default searches 50 km around the center of the box).")
-        stations = []
+
+        if candidates and sys.stdin.isatty():
+            # Interactive prompt for non-technical users
+            closest = min(candidates, key=lambda s: haversine_distance(
+                (args.lat_min + args.lat_max)/2, (args.lon_min + args.lon_max)/2,
+                s["latitude"], s["longitude"]
+            ))
+            closest_dist = haversine_distance(
+                (args.lat_min + args.lat_max)/2, (args.lon_min + args.lon_max)/2,
+                closest["latitude"], closest["longitude"]
+            )
+            print(f"\nClosest station found in search is about {int(closest_dist)} meters from the center of your box.")
+            try:
+                answer = input("Would you like to include stations outside the box? Enter max meters outside (e.g. 2000) or press Enter for 2000m, or 'n' to skip: ").strip()
+                if answer.lower() in ('', 'y', 'yes'):
+                    new_dist = 2000
+                elif answer.lower() in ('n', 'no'):
+                    new_dist = 0
+                else:
+                    new_dist = int(answer)
+                if new_dist > 0:
+                    stations = filter_stations_by_box(candidates, args.lat_min, args.lat_max, args.lon_min, args.lon_max, new_dist)
+                    if stations:
+                        args.max_station_distance_from_box = new_dist  # for logging
+                        stations_df = pd.DataFrame(stations)
+                        stations_path = output_dir / "stations_in_box.csv"
+                        stations_df.to_csv(stations_path, index=False)
+                        print(f"Using stations up to {new_dist}m outside the box. Saved {len(stations)} stations to {stations_path}")
+                        print(stations_df[["station_id", "name", "latitude", "longitude", "distance_m"]].head())
+                        # Re-do cost estimate
+                        try:
+                            days = (end_dt - start_dt).days + 1
+                            num_st = len(stations)
+                            est = estimate_records_and_cost(days, num_st, args.resolution, args.plan == "paid")
+                            print(f"\nUpdated cost estimate (with {num_st} stations): ~${est['est_total_cost']:.2f} total, ~${est['est_billable_cost']:.2f} billable after free allowance.\n")
+                        except:
+                            pass
+            except (EOFError, ValueError, KeyboardInterrupt):
+                print("Skipping outside stations.")
+        stations = stations if 'stations' in locals() else []
 
     # 2. Download the main "area" historical data (blended from stations near the box)
     # Determine resolution settings (user-friendly: default hourly, but support daily)
