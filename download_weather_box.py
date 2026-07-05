@@ -84,6 +84,28 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
+
+def estimate_records_and_cost(days, num_stations, resolution, is_paid):
+    """Rough cost estimate for non-technical users."""
+    hours = days * 24
+    area_recs = hours
+    per_station_recs = hours * num_stations if num_stations else hours * 5  # rough guess
+    total_recs = area_recs + per_station_recs
+    cost_per_record = 0.0001  # metered rate
+    total_cost = total_recs * cost_per_record
+    daily_free = 1000
+    free_recs = daily_free * days
+    billable_recs = max(0, total_recs - free_recs)
+    billable_cost = billable_recs * cost_per_record
+    return {
+        'hours': hours,
+        'area': area_recs,
+        'per_station': per_station_recs,
+        'total': total_recs,
+        'est_total_cost': total_cost,
+        'est_billable_cost': billable_cost
+    }
+
 def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
                              max_distance=None, max_stations=None, sample_date="2024-07-01"):
     """
@@ -287,8 +309,8 @@ def main():
     parser.add_argument("--unit-group", default="metric", choices=["us", "uk", "metric", "base"])
     parser.add_argument("--resolution", default="hourly", choices=["hourly", "daily"],
                         help="hourly (default - what you want, but creates big files) or daily (much smaller and faster, good for testing large date ranges first)")
-    parser.add_argument("--plan", default="free", choices=["free", "paid"],
-                        help="Your Visual Crossing plan. Use 'paid' if you have a paid metered subscription. This allows much larger chunks and higher station limits (recommended if you just upgraded).")
+    parser.add_argument("--plan", default="paid", choices=["free", "paid"],
+                        help="Your Visual Crossing plan. Default is now 'paid' since you upgraded. Use 'free' only if you're on the free tier.")
     parser.add_argument("--max-stations", type=int, default=None,
                         help="ADVANCED: Max number of weather stations to consider (Visual Crossing default is 3). Paid plans allow higher values.")
     parser.add_argument("--max-distance", type=int, default=None,
@@ -311,6 +333,20 @@ def main():
 
     # Make resolution label available for later prints and filenames even if some blocks are skipped
     res_label = "hourly" if args.resolution == "hourly" else "daily"
+
+    # Cost estimate using the helper (preliminary, assumes ~5 stations)
+    try:
+        start_dt = datetime.fromisoformat(args.start)
+        end_dt = datetime.fromisoformat(args.end)
+        days = (end_dt - start_dt).days + 1
+        est = estimate_records_and_cost(days, 5, args.resolution, args.plan == "paid")
+        print("Preliminary cost estimate (before exact # of stations):")
+        print(f"  ~{est['hours']:,} hours → ~{est['total']:,} records (area + ~5 stations)")
+        print(f"  Rough total cost: ${est['est_total_cost']:.2f}")
+        print(f"  After daily free allowance (~{1000*days:,} records): ~${est['est_billable_cost']:.2f}")
+        print(f"  (Will refine after discovering actual stations in the box.)\n")
+    except Exception:
+        pass
 
     # Friendly warning for non-technical users doing big pulls
     try:
@@ -353,6 +389,23 @@ def main():
         stations_df.to_csv(stations_path, index=False)
         print(f"Saved {len(stations)} stations to {stations_path}")
         print(stations_df[["station_id", "name", "latitude", "longitude", "distance_m"]].head())
+
+        # Better cost estimate now that we know number of stations
+        try:
+            start_dt = datetime.fromisoformat(args.start)
+            end_dt = datetime.fromisoformat(args.end)
+            days = (end_dt - start_dt).days + 1
+            num_st = len(stations)
+            est = estimate_records_and_cost(days, num_st, args.resolution, args.plan == "paid")
+            print(f"\nUpdated cost estimate (with {num_st} stations in box):")
+            print(f"  Area query: ~{est['area']:,} records")
+            print(f"  Per-station queries: ~{est['station_recs']:,} records")
+            print(f"  Total estimated: ~{est['total']:,} records")
+            print(f"  Estimated cost at $0.0001/record: ${est['est_total_cost']:.2f}")
+            print(f"  After daily free allowance: ~${est['est_billable_cost']:.2f}")
+            print(f"  (Upper bound; many per-station queries may return partial or cached data. Check your Visual Crossing usage dashboard.)\n")
+        except Exception:
+            pass
     else:
         print("No stations found in box. Try increasing the search radius or adjusting the box.")
         stations = []
