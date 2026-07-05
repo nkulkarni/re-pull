@@ -38,7 +38,7 @@ Usage examples:
         --start 2020-01-01 --end 2025-12-31
 
     # For a very small box (e.g. 500m radius) where no stations are inside:
-    # Allow stations up to 2000m outside the box
+    # Allow stations up to 2000 METERS (2 km) outside the box
     python download_weather_box.py \
         --lat-min 44.0802 --lat-max 44.0892 \
         --lon-min -76.9657 --lon-max -76.9532 \
@@ -195,9 +195,11 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
     logger.info(f"Discovered {len(all_stations)} stations in search radius; "
                 f"{len(acceptable_stations)} inside or within {max_station_distance_from_box}m of the box.")
     if len(acceptable_stations) == 0 and len(all_stations) > 0:
-        # Find closest for helpful message (all now have the key)
+        # Find closest for helpful message
         closest = min(all_stations, key=lambda s: s.get("distance_to_box_m", 999999))
-        logger.info(f"Closest station is {closest.get('distance_to_box_m')}m from the box.")
+        dist = closest.get('distance_to_box_m', 2000)
+        logger.info(f"Closest station is {dist} meters ({dist/1000:.1f} km) from the box. "
+                    f"Try --max-station-distance-from-box {dist + 500} (or round to 2000 for 2 km) or higher.")
     return acceptable_stations
 
 def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours,obs,stations",
@@ -349,9 +351,16 @@ def main():
     parser.add_argument("--max-distance", type=int, default=None,
                         help="ADVANCED: Max distance in meters to search for stations (default ~80km). Paid plans allow higher values (e.g. 200000 for 200km).")
     parser.add_argument("--station-search-radius", type=int, default=50000,
-                        help="Search radius in meters around the box center when looking for weather stations (default 50 km). Increase for rural areas.")
+                        help="How far from the CENTER of your box to ask the weather service to look for stations (in METERS, default 50,000 = 50 km). "
+                             "This is the initial search radius. Then the --max-station-distance-from-box filter is applied. "
+                             "Increase this (e.g. 100000 for 100 km) in very rural areas.")
     parser.add_argument("--max-station-distance-from-box", type=int, default=0,
-                        help="Include weather stations up to this many meters *outside* the box. 0 = only stations strictly inside the box. Useful for small boxes (e.g. 500m) where no stations exist inside. Example: 2000 for stations within 2km of the box.")
+                        help="How far OUTSIDE your exact box, in METERS, to accept weather stations. "
+                             "0 = strictly inside box only (default). "
+                             "For small boxes (e.g. 500 m radius), set this >0. "
+                             "THE NUMBER IS ALWAYS IN METERS (not km). "
+                             "2000 = 2000 meters = 2 km. "
+                             "Example: --max-station-distance-from-box 2000   # allow stations up to 2 km outside the box")
     args = parser.parse_args()
 
     api_key = get_api_key()
@@ -447,9 +456,11 @@ def main():
         except Exception:
             pass
     else:
-        print("No stations found in box (or within the allowed distance outside it).")
-        print("Tip for small boxes: use --max-station-distance-from-box 2000 (for example) to include stations up to 2 km outside the box.")
-        print("You can also increase --station-search-radius (default 50km search area around center).")
+        print("No stations found inside your box (or within the --max-station-distance-from-box you allowed).")
+        print("For a tiny box like 500 m, you will almost always need to allow some stations from outside.")
+        print("The number for --max-station-distance-from-box is in METERS.")
+        print("   Example: --max-station-distance-from-box 2000   means allow stations up to 2000 meters (2 km) outside the box.")
+        print("You can also increase --station-search-radius (default searches 50 km around the center of the box).")
         stations = []
 
     # 2. Download the main "area" historical data (blended from stations near the box)
