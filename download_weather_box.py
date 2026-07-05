@@ -37,6 +37,14 @@ Usage examples:
         --lat-min 42.0 --lat-max 44.5 --lon-min -82.5 --lon-max -79.0 \
         --start 2020-01-01 --end 2025-12-31
 
+    # For a very small box (e.g. 500m radius) where no stations are inside:
+    # Allow stations up to 2000m outside the box
+    python download_weather_box.py \
+        --lat-min 44.0802 --lat-max 44.0892 \
+        --lon-min -76.9657 --lon-max -76.9532 \
+        --max-station-distance-from-box 2000 \
+        --start 2024-07-01 --end 2024-07-07
+
 The script uses metric units by default. Change --unit-group if needed.
 It defaults to hourly (what you asked for). Use --resolution daily for much smaller/faster downloads.
 
@@ -107,7 +115,8 @@ def estimate_records_and_cost(days, num_stations, resolution, is_paid):
     }
 
 def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
-                             max_distance=None, max_stations=None, sample_date="2024-07-01"):
+                             max_distance=None, max_stations=None, sample_date="2024-07-01",
+                             station_search_radius=50000, max_station_distance_from_box=0):
     """
     Discover weather stations around the box by querying the center point with
     large max* settings. Then filter to stations inside the box.
@@ -118,7 +127,7 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
 
     # Sensible defaults that work on free plans; paid users can go much higher
     if max_distance is None:
-        max_distance = 150000   # 150 km
+        max_distance = station_search_radius or 150000   # 150 km
     if max_stations is None:
         max_stations = 30
 
@@ -134,7 +143,7 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
     }
 
     logger.info(f"Discovering stations near center {center_lat:.4f},{center_lon:.4f} "
-                f"(maxDistance={max_distance}m, maxStations={max_stations})")
+                f"(search radius={max_distance}m, maxStations={max_stations})")
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -157,15 +166,39 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
             "contribution": sinfo.get("contribution", 100),  # percentage in some responses
         })
 
-    # Filter to inside the box
-    in_box = [
-        s for s in all_stations
-        if lat_min <= s["latitude"] <= lat_max and lon_min <= s["longitude"] <= lon_max
-    ]
+    # Filter: stations strictly inside box OR within max_station_distance_from_box of the box
+    # (user can set this via --max-station-distance-from-box to pull nearby stations for tiny boxes)
+    def station_is_acceptable(s, lat_min, lat_max, lon_min, lon_max, max_dist_outside):
+        slat = s["latitude"]
+        slon = s["longitude"]
+        # Strictly inside?
+        if lat_min <= slat <= lat_max and lon_min <= slon <= lon_max:
+            return True, 0.0
+        # Always compute distance to closest point in the box (clamped)
+        closest_lat = max(lat_min, min(slat, lat_max))
+        closest_lon = max(lon_min, min(slon, lon_max))
+        dist = haversine_distance(slat, slon, closest_lat, closest_lon)
+        if max_dist_outside <= 0:
+            return False, dist
+        return dist <= max_dist_outside, dist
+
+    acceptable_stations = []
+    for s in all_stations:
+        ok, dist = station_is_acceptable(
+            s, lat_min, lat_max, lon_min, lon_max, max_station_distance_from_box
+        )
+        s = s.copy()
+        s["distance_to_box_m"] = round(dist) if dist is not None else 999999
+        if ok:
+            acceptable_stations.append(s)
 
     logger.info(f"Discovered {len(all_stations)} stations in search radius; "
-                f"{len(in_box)} strictly inside the box.")
-    return in_box
+                f"{len(acceptable_stations)} inside or within {max_station_distance_from_box}m of the box.")
+    if len(acceptable_stations) == 0 and len(all_stations) > 0:
+        # Find closest for helpful message (all now have the key)
+        closest = min(all_stations, key=lambda s: s.get("distance_to_box_m", 999999))
+        logger.info(f"Closest station is {closest.get('distance_to_box_m')}m from the box.")
+    return acceptable_stations
 
 def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours,obs,stations",
                          unit_group="metric", extra_params=None, max_retries=5):
@@ -315,6 +348,10 @@ def main():
                         help="ADVANCED: Max number of weather stations to consider (Visual Crossing default is 3). Paid plans allow higher values.")
     parser.add_argument("--max-distance", type=int, default=None,
                         help="ADVANCED: Max distance in meters to search for stations (default ~80km). Paid plans allow higher values (e.g. 200000 for 200km).")
+    parser.add_argument("--station-search-radius", type=int, default=50000,
+                        help="Search radius in meters around the box center when looking for weather stations (default 50 km). Increase for rural areas.")
+    parser.add_argument("--max-station-distance-from-box", type=int, default=0,
+                        help="Include weather stations up to this many meters *outside* the box. 0 = only stations strictly inside the box. Useful for small boxes (e.g. 500m) where no stations exist inside. Example: 2000 for stations within 2km of the box.")
     args = parser.parse_args()
 
     api_key = get_api_key()
@@ -377,10 +414,13 @@ def main():
         default_max_stations = 30
         default_max_distance = 150000
 
+    effective_search_radius = args.station_search_radius or default_max_distance
     stations = discover_stations_in_box(
         api_key, args.lat_min, args.lat_max, args.lon_min, args.lon_max,
-        max_distance=args.max_distance or default_max_distance,
-        max_stations=args.max_stations or default_max_stations
+        max_distance=effective_search_radius,
+        max_stations=args.max_stations or default_max_stations,
+        max_station_distance_from_box=args.max_station_distance_from_box,
+        station_search_radius=args.station_search_radius
     )
 
     if stations:
@@ -407,7 +447,9 @@ def main():
         except Exception:
             pass
     else:
-        print("No stations found in box. Try increasing the search radius or adjusting the box.")
+        print("No stations found in box (or within the allowed distance outside it).")
+        print("Tip for small boxes: use --max-station-distance-from-box 2000 (for example) to include stations up to 2 km outside the box.")
+        print("You can also increase --station-search-radius (default 50km search area around center).")
         stations = []
 
     # 2. Download the main "area" historical data (blended from stations near the box)
