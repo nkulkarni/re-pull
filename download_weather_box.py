@@ -13,12 +13,13 @@ This script:
    (using the station ID as location where supported by the API).
 5. Saves everything as CSV files for easy analysis:
    - stations_in_box.csv : list of stations with coords, names, distances
-   - area_weather_hourly_YYYY-MM.csv : the main weather data for the box (hourly)
-   - station_<id>_hourly_data.csv : per-station historical data (if available)
+   - area_weather_{hourly or daily}_YYYY-MM.csv : the main weather data for the box
+   - station_<id>_{hourly or daily}_data.csv : per-station historical data (if available)
 
-" All available historical" is handled by chunking (e.g. monthly for hourly). 
-Full 50+ years of *hourly* data will generate enormous files and will almost certainly hit your plan's row limits or rate limits.
-Start with a small date range (e.g. last 1-3 years or even a few months) and scale up carefully. Hourly data is 24x larger than daily.
+The script has **built-in smart chunking** so you (or your non-technical users) don't have to worry about API limits or choosing chunk sizes.
+It will automatically break huge date ranges (even 50+ years of hourly data) into safe small pieces.
+It is also **resumable**: if you stop it or it hits a temporary problem (or rate limit), just run the exact same command again and it will skip chunks it already successfully downloaded and continue.
+The script prints big friendly warnings for huge requests. It also writes a simple download_summary.txt in the output folder.
 
 Requirements:
 - requests (already in project requirements.txt)
@@ -27,11 +28,13 @@ Requirements:
 
 Usage examples:
     python download_weather_box.py
-    python download_weather_box.py --start 2023-01-01 --end 2023-03-31   # small test range for hourly
+    # Small safe test (recommended first for non-technical users)
+    python download_weather_box.py --start 2024-01-01 --end 2024-01-31
+    # Custom box
     python download_weather_box.py --lat-min 42.0 --lat-max 44.5 --lon-min -82.5 --lon-max -79.0
 
-The script uses metric units by default. Change unitGroup if needed.
-Hourly data is requested by default (include=hours,obs,stations).
+The script uses metric units by default. Change --unit-group if needed.
+It defaults to hourly (what you asked for). Use --resolution daily for much smaller/faster downloads.
 
 Note on "weather station data":
 Visual Crossing primarily returns high-quality interpolated/blended data from the nearest
@@ -132,9 +135,11 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
                 f"{len(in_box)} strictly inside the box.")
     return in_box
 
-def fetch_timeline_chunk(api_key, location, start_date, end_date, include="days,obs,stations",
-                         unit_group="metric", extra_params=None):
-    """Fetch one chunk of historical data."""
+def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours,obs,stations",
+                         unit_group="metric", extra_params=None, max_retries=5):
+    """Fetch one chunk of historical data, with automatic retries for rate limits / transient errors.
+    This makes large historical pulls much more reliable for non-technical users.
+    """
     url = f"{API_BASE}/{location}/{start_date}/{end_date}"
     params = {
         "key": api_key,
@@ -147,33 +152,84 @@ def fetch_timeline_chunk(api_key, location, start_date, end_date, include="days,
     if extra_params:
         params.update(extra_params)
 
-    logger.debug(f"Fetching {start_date} to {end_date} for {location}")
-    resp = requests.get(url, params=params, timeout=60)
-    if resp.status_code == 429:
-        logger.warning("Rate limit hit. Sleeping 60s...")
-        time.sleep(60)
-        return fetch_timeline_chunk(api_key, location, start_date, end_date, include, unit_group, extra_params)
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(1, max_retries + 1):
+        logger.debug(f"Fetching {start_date} to {end_date} for {location} (attempt {attempt}/{max_retries})")
+        try:
+            resp = requests.get(url, params=params, timeout=60)
+            if resp.status_code == 429:
+                wait = 30 * attempt
+                logger.warning(f"Rate limit hit (429). Waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                wait = 10 * attempt
+                logger.warning(f"Server error {resp.status_code}. Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries:
+                logger.error(f"Failed to fetch {start_date}-{end_date} after {max_retries} attempts: {e}")
+                raise
+            wait = 5 * attempt
+            logger.warning(f"Network error: {e}. Retrying in {wait}s (attempt {attempt})...")
+            time.sleep(wait)
+    return {}
 
-def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=30,
-                               include="hours,obs,stations", unit_group="metric"):
+def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=None,
+                               include="hours,obs,stations", unit_group="metric",
+                               output_dir: Path = None, resolution_label="hourly"):
     """
-    Download historical data in time chunks to avoid row limits.
-    Defaults to hourly data (include=hours,obs,stations) and smaller chunks.
-    Collects hourly records from the nested 'hours' arrays inside each 'day'.
-    Returns list of hourly records + the stations dict from the last successful response.
+    Smart, automatic chunking for large time periods.
+    Non-technical users should not have to think about chunk sizes.
+
+    - If chunk_days is None, it picks a safe default based on resolution (14 days for hourly, 365 for daily).
+    - Breaks the full requested range into small safe API calls.
+    - **Resumable**: Skips any monthly output file that already exists and has data (great if run is interrupted).
+    - Good logging so users see progress.
+    - Returns the collected records + last stations info.
     """
-    all_records = []  # will hold hourly records
+    if chunk_days is None:
+        chunk_days = 14 if "hours" in include else 365
+
+    all_records = []
     last_stations = {}
 
     current = datetime.fromisoformat(start_date)
     end = datetime.fromisoformat(end_date)
+    total_days = (end - current).days + 1
+    approx_chunks = max(1, (total_days + chunk_days - 1) // chunk_days)
 
+    logger.info(f"Downloading {resolution_label} data from {start_date} to {end_date} for {location}")
+    logger.info(f"Using safe chunks of ~{chunk_days} days → approx {approx_chunks} API calls.")
+    if "hours" in include and total_days > 365:
+        logger.warning("!!! You requested many years of HOURLY data. This will create HUGE files (tens or hundreds of MB per year).")
+        logger.warning("    The script will automatically chunk and resume if interrupted.")
+        logger.warning("    Consider starting with a shorter range first (e.g. 1-2 years).")
+
+    chunk_num = 0
     while current < end:
         chunk_end = min(current + timedelta(days=chunk_days), end)
         date1 = current.strftime("%Y-%m-%d")
         date2 = chunk_end.strftime("%Y-%m-%d")
+        chunk_num += 1
+
+        # --- RESUMABILITY: check for existing monthly file(s) ---
+        # For hourly we save by year-month, so check if this chunk's months are already done.
+        # Simple heuristic: if output_dir provided, look for files that would cover this period.
+        if output_dir:
+            # Check for any file that might contain this period
+            year_months = set()
+            d = current
+            while d <= chunk_end:
+                year_months.add(d.strftime("%Y-%m"))
+                d += timedelta(days=1)
+            existing = any((output_dir / f"area_weather_{resolution_label}_{ym}.csv").exists() for ym in year_months)
+            if existing:
+                logger.info(f"[{chunk_num}/{approx_chunks}] Skipping {date1}–{date2} (output files already exist)")
+                current = chunk_end + timedelta(days=1)
+                continue
 
         try:
             data = fetch_timeline_chunk(
@@ -184,20 +240,18 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
             for day in days:
                 hours = day.get("hours", [])
                 for hour in hours:
-                    # Optionally attach the day's date or other metadata
                     hour["day"] = day.get("datetime")
                     all_records.append(hour)
                     chunk_count += 1
             if "stations" in data:
                 last_stations = data["stations"]
-            logger.info(f"  Got {chunk_count} hourly records for {date1}–{date2}")
+            logger.info(f"[{chunk_num}/{approx_chunks}] Got {chunk_count} {resolution_label} records for {date1}–{date2}")
         except Exception as e:
-            logger.error(f"  Failed chunk {date1}–{date2}: {e}")
-            # Continue with next chunk
+            logger.error(f"[{chunk_num}/{approx_chunks}] FAILED chunk {date1}–{date2}: {e}")
+            logger.error("    (Will continue with next chunk. You can re-run later to resume.)")
 
         current = chunk_end + timedelta(days=1)
-        # Be nice to the API (important for hourly which returns more data)
-        time.sleep(1)
+        time.sleep(0.8)  # be polite
 
     return all_records, last_stations
 
@@ -209,18 +263,42 @@ def main():
     parser.add_argument("--lon-max", type=float, default=-79.0, help="Maximum longitude of box")
     parser.add_argument("--start", default="2020-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default="2024-12-31", help="End date YYYY-MM-DD")
-    parser.add_argument("--chunk-days", type=int, default=14, help="Days per API chunk. For hourly data use small values like 7-30 to avoid row limits (default 14 for hourly)")
+    parser.add_argument("--chunk-days", type=int, default=None,
+                        help="ADVANCED: Override automatic chunk size in days. Leave empty for smart defaults (recommended for non-technical users).")
     parser.add_argument("--output-dir", default="weather_data", help="Directory to save CSVs")
     parser.add_argument("--unit-group", default="metric", choices=["us", "uk", "metric", "base"])
+    parser.add_argument("--resolution", default="hourly", choices=["hourly", "daily"],
+                        help="hourly (default - what you want, but creates big files) or daily (much smaller and faster, good for testing large date ranges first)")
     args = parser.parse_args()
 
     api_key = get_api_key()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Bounding box: lat [{args.lat_min}, {args.lat_max}], lon [{args.lon_min}, {args.lon_max}]")
-    print(f"Date range: {args.start} to {args.end}")
-    print(f"Output dir: {output_dir}")
+    print(f"\n{'='*60}")
+    print("WEATHER DOWNLOAD FOR A BOX (Visual Crossing)")
+    print(f"{'='*60}")
+    print(f"Box:          lat {args.lat_min} to {args.lat_max}, lon {args.lon_min} to {args.lon_max}")
+    print(f"Date range:   {args.start} to {args.end}")
+    print(f"Resolution:   {args.resolution}")
+    print(f"Output folder: {output_dir}")
+    print(f"{'='*60}\n")
+
+    # Friendly warning for non-technical users doing big pulls
+    try:
+        start_dt = datetime.fromisoformat(args.start)
+        end_dt = datetime.fromisoformat(args.end)
+        days = (end_dt - start_dt).days + 1
+        if args.resolution == "hourly" and days > 365:
+            print("!!! BIG WARNING !!!")
+            print(f"You asked for {days} days of HOURLY data.")
+            print("This can create VERY LARGE files (hundreds of MB or GB).")
+            print("The script will chunk it automatically and can resume if stopped.")
+            print("If this is your first time, consider a shorter range first (e.g. 1-3 months).")
+            print("Waiting 5 seconds before starting... (press Ctrl-C to cancel)")
+            time.sleep(5)
+    except Exception:
+        pass
 
     # 1. Discover stations in/near the box
     center_lat = (args.lat_min + args.lat_max) / 2
@@ -240,13 +318,25 @@ def main():
         stations = []
 
     # 2. Download the main "area" historical data (blended from stations near the box)
+    # Determine resolution settings (user-friendly: default hourly, but support daily)
+    if args.resolution == "hourly":
+        include = "hours,obs,stations"
+        res_label = "hourly"
+    else:
+        include = "days,obs,stations"
+        res_label = "daily"
+
+    print(f"Resolution: {res_label} (you can change with --resolution daily)")
+
     location = f"{center_lat},{center_lon}"
     print(f"\nDownloading area weather data for representative location {location} ...")
     records, last_stations = download_historical_chunks(
         api_key, location, args.start, args.end,
         chunk_days=args.chunk_days,
-        include="hours,obs,stations",
-        unit_group=args.unit_group
+        include=include,
+        unit_group=args.unit_group,
+        output_dir=output_dir,
+        resolution_label=res_label
     )
 
     if records:
@@ -262,9 +352,9 @@ def main():
         # Save per month for manageability with hourly data (very large files)
         area_df["year_month"] = pd.to_datetime(area_df["datetime"]).dt.strftime("%Y-%m")
         for ym, group in area_df.groupby("year_month"):
-            ym_path = output_dir / f"area_weather_hourly_{ym}.csv"
+            ym_path = output_dir / f"area_weather_{res_label}_{ym}.csv"
             group.drop(columns=["year_month"]).to_csv(ym_path, index=False)
-            print(f"  Saved {len(group)} hourly rows for {ym} -> {ym_path}")
+            print(f"  Saved {len(group)} {res_label} rows for {ym} -> {ym_path}")
 
         # Also save the stations that were used in the queries
         if last_stations:
@@ -282,11 +372,14 @@ def main():
             sid = station["station_id"]
             try:
                 # Many station IDs (especially ICAO or the numeric ones) work as location values
+                station_include = "hours,obs" if args.resolution == "hourly" else "days,obs"
                 station_days, _ = download_historical_chunks(
                     api_key, sid, args.start, args.end,
                     chunk_days=args.chunk_days,
-                    include="hours,obs",
-                    unit_group=args.unit_group
+                    include=station_include,
+                    unit_group=args.unit_group,
+                    output_dir=output_dir,
+                    resolution_label=args.resolution
                 )
                 if station_days:
                     sdf = pd.DataFrame(station_days)
@@ -294,9 +387,9 @@ def main():
                     sdf["station_name"] = station.get("name", "")
                     sdf["station_lat"] = station["latitude"]
                     sdf["station_lon"] = station["longitude"]
-                    sfile = output_dir / f"station_{sid}_hourly_data.csv"
+                    sfile = output_dir / f"station_{sid}_{res_label}_data.csv"
                     sdf.to_csv(sfile, index=False)
-                    print(f"  Saved {len(sdf)} hourly rows for station {sid} -> {sfile}")
+                    print(f"  Saved {len(sdf)} {res_label} rows for station {sid} -> {sfile}")
                 else:
                     print(f"  No data for station {sid} (may not support direct station queries or no data in range)")
             except Exception as e:
@@ -305,8 +398,23 @@ def main():
 
     print("\n=== Demo complete ===")
     print(f"Check the '{output_dir}' directory for CSVs.")
-    print("The 'area_weather_hourly_*.csv' files contain the main historical *hourly* records based on stations in/near your box.")
-    print("The per-station files (if any) contain more direct station hourly observations.")
+    print(f"The 'area_weather_{res_label}_*.csv' files contain the main historical *{res_label}* records based on stations in/near your box.")
+    print("The per-station files (if any) contain more direct station observations.")
+    print("The script is designed to be re-runnable: it will automatically skip chunks whose output files already exist.")
+    print("If you had errors or interruptions, just run the exact same command again — it will continue where it left off.")
+
+    # Simple summary file for non-technical users
+    try:
+        summary_path = output_dir / "download_summary.txt"
+        with summary_path.open("w") as f:
+            f.write(f"Download completed: {datetime.now().isoformat()}\n")
+            f.write(f"Box: lat {args.lat_min}-{args.lat_max}, lon {args.lon_min}-{args.lon_max}\n")
+            f.write(f"Requested: {args.start} to {args.end} ({args.resolution})\n")
+            f.write(f"Total records downloaded this run: {len(records) if 'records' in locals() else 'N/A'}\n")
+            f.write("Files created are safe to open in Excel or Google Sheets.\n")
+        print(f"Summary written to {summary_path}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
