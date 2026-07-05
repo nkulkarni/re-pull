@@ -242,6 +242,8 @@ It uses the **Visual Crossing** weather API to:
 
 You can change the box with --lat-min / --lat-max / --lon-min / --lon-max and the date range.
 
+**For very small boxes** (e.g. 500m around a specific point), there are often no weather stations exactly inside. If you run the command in a terminal, the script will detect this and interactively ask you something like: "Closest station is 1.7 km away. Use stations up to 2 km outside? [press Enter for 2000m or type a number]". You can also pre-specify with --max-station-distance-from-box 2000 (the value is in meters; 2000 = 2 km). This lets you include the nearest real stations without changing your core box.
+
 Later we will integrate this into the main engine so new farm listings automatically get nearby weather history attached.
 
 This project is intended as a personal/research tool. Be kind to the websites you scrape.
