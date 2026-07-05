@@ -207,6 +207,34 @@ New sources are added by creating a file in `sources/` and registering it.
 
 ---
 
+## Weather Data Integration (New Phase)
+
+We are beginning to enrich the farm listings with historical weather data from nearby weather stations.
+
+A demo script is included: `download_weather_box.py`
+
+It uses the **Visual Crossing** weather API to:
+- Discover all weather stations inside or near a lat/long bounding box.
+- Download historical observations (daily by default) for the area.
+- Attempt to pull direct historical data from each individual station in the box.
+- Save clean CSVs (stations list + weather records) that you can join to your master listings by proximity or date.
+
+### Quick start for weather data
+1. Get a free Visual Crossing API key at https://www.visualcrossing.com/ (first 1000 records/day free for commercial use too).
+2. `export VISUALCROSSING_API_KEY=your_key_here`
+3. Run the demo (uses a southern Ontario box by default):
+   ```bash
+   python download_weather_box.py --start 2023-01-01 --end 2023-12-31
+   ```
+4. Look in the new `weather_data/` folder for:
+   - `stations_in_box.csv`
+   - `area_weather_*.csv`
+   - Per-station files (where available)
+
+You can change the box with --lat-min / --lat-max / --lon-min / --lon-max and the date range.
+
+Later we will integrate this into the main engine so new farm listings automatically get nearby weather history attached.
+
 This project is intended as a personal/research tool. Be kind to the websites you scrape.
 
 Contributions and new sources are welcome!
