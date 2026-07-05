@@ -284,6 +284,9 @@ def main():
     print(f"Output folder: {output_dir}")
     print(f"{'='*60}\n")
 
+    # Make resolution label available for later prints and filenames even if some blocks are skipped
+    res_label = "hourly" if args.resolution == "hourly" else "daily"
+
     # Friendly warning for non-technical users doing big pulls
     try:
         start_dt = datetime.fromisoformat(args.start)

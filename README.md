@@ -213,9 +213,15 @@ We are beginning to enrich the farm listings with historical weather data from n
 
 A demo script is included: `download_weather_box.py`
 
+It is deliberately written to be as foolproof as possible for non-technical users:
+- You do **not** need to choose chunk sizes — it automatically breaks huge date ranges (even 50+ years of hourly data) into safe API-sized pieces.
+- It is **resumable**: if it gets interrupted or hits a temporary rate limit, just run the exact same command again and it will skip what it already downloaded and continue.
+- Prints very clear warnings and progress messages.
+- At the end it writes a simple `download_summary.txt` in the output folder.
+
 It uses the **Visual Crossing** weather API to:
 - Discover all weather stations inside or near a lat/long bounding box.
-- Download historical observations (daily by default) for the area.
+- Download historical observations (hourly by default — use --resolution daily for much smaller/faster results) for the area.
 - Attempt to pull direct historical data from each individual station in the box.
 - Save clean CSVs (stations list + weather records) that you can join to your master listings by proximity or date.
 
