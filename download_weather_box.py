@@ -23,15 +23,19 @@ The script prints big friendly warnings for huge requests. It also writes a simp
 
 Requirements:
 - requests (already in project requirements.txt)
-- A Visual Crossing API key (sign up at https://www.visualcrossing.com/ for free tier)
+- A Visual Crossing API key (sign up at https://www.visualcrossing.com/)
 - Set environment variable: VISUALCROSSING_API_KEY=your_key_here
+- Add --plan paid if you have a paid metered subscription (allows much larger/faster pulls and more stations per query).
 
 Usage examples:
     python download_weather_box.py
     # Small safe test (recommended first for non-technical users)
     python download_weather_box.py --start 2024-01-01 --end 2024-01-31
-    # Custom box
-    python download_weather_box.py --lat-min 42.0 --lat-max 44.5 --lon-min -82.5 --lon-max -79.0
+    # Custom box + paid metered plan (recommended for serious historical pulls)
+    python download_weather_box.py \
+        --plan paid \
+        --lat-min 42.0 --lat-max 44.5 --lon-min -82.5 --lon-max -79.0 \
+        --start 2020-01-01 --end 2025-12-31
 
 The script uses metric units by default. Change --unit-group if needed.
 It defaults to hourly (what you asked for). Use --resolution daily for much smaller/faster downloads.
@@ -81,7 +85,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
-                             max_distance=150000, max_stations=30, sample_date="2024-07-01"):
+                             max_distance=None, max_stations=None, sample_date="2024-07-01"):
     """
     Discover weather stations around the box by querying the center point with
     large max* settings. Then filter to stations inside the box.
@@ -89,6 +93,12 @@ def discover_stations_in_box(api_key, lat_min, lat_max, lon_min, lon_max,
     center_lat = (lat_min + lat_max) / 2
     center_lon = (lon_min + lon_max) / 2
     location = f"{center_lat},{center_lon}"
+
+    # Sensible defaults that work on free plans; paid users can go much higher
+    if max_distance is None:
+        max_distance = 150000   # 150 km
+    if max_stations is None:
+        max_stations = 30
 
     url = f"{API_BASE}/{location}/{sample_date}/{sample_date}"
     params = {
@@ -179,19 +189,24 @@ def fetch_timeline_chunk(api_key, location, start_date, end_date, include="hours
 
 def download_historical_chunks(api_key, location, start_date, end_date, chunk_days=None,
                                include="hours,obs,stations", unit_group="metric",
-                               output_dir: Path = None, resolution_label="hourly"):
+                               output_dir: Path = None, resolution_label="hourly",
+                               is_paid=False):
     """
     Smart, automatic chunking for large time periods.
     Non-technical users should not have to think about chunk sizes.
 
-    - If chunk_days is None, it picks a safe default based on resolution (14 days for hourly, 365 for daily).
+    - Chooses safe chunk size automatically based on resolution + whether you have a paid plan.
+    - Paid users get significantly larger chunks (faster, fewer calls).
     - Breaks the full requested range into small safe API calls.
     - **Resumable**: Skips any monthly output file that already exists and has data (great if run is interrupted).
     - Good logging so users see progress.
     - Returns the collected records + last stations info.
     """
     if chunk_days is None:
-        chunk_days = 14 if "hours" in include else 365
+        if is_paid:
+            chunk_days = 90 if "hours" in include else 1825   # ~5 years for daily on paid
+        else:
+            chunk_days = 14 if "hours" in include else 365
 
     all_records = []
     last_stations = {}
@@ -202,13 +217,19 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
     approx_chunks = max(1, (total_days + chunk_days - 1) // chunk_days)
 
     logger.info(f"Downloading {resolution_label} data from {start_date} to {end_date} for {location}")
-    logger.info(f"Using safe chunks of ~{chunk_days} days → approx {approx_chunks} API calls.")
+    logger.info(f"Plan: {'paid' if is_paid else 'free'} → using chunks of ~{chunk_days} days → approx {approx_chunks} API calls.")
+
     if "hours" in include and total_days > 365:
-        logger.warning("!!! You requested many years of HOURLY data. This will create HUGE files (tens or hundreds of MB per year).")
-        logger.warning("    The script will automatically chunk and resume if interrupted.")
-        logger.warning("    Consider starting with a shorter range first (e.g. 1-2 years).")
+        if is_paid:
+            logger.warning("You requested many years of HOURLY data on a paid plan. This will still create large files.")
+            logger.warning("The script will chunk automatically and can resume. Monitor your Visual Crossing usage dashboard.")
+        else:
+            logger.warning("!!! You requested many years of HOURLY data on the FREE plan. This will likely hit limits.")
+            logger.warning("    Strongly consider using --resolution daily or a much shorter date range.")
 
     chunk_num = 0
+    sleep_time = 0.3 if is_paid else 0.8   # paid users can go a bit faster
+
     while current < end:
         chunk_end = min(current + timedelta(days=chunk_days), end)
         date1 = current.strftime("%Y-%m-%d")
@@ -216,10 +237,7 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
         chunk_num += 1
 
         # --- RESUMABILITY: check for existing monthly file(s) ---
-        # For hourly we save by year-month, so check if this chunk's months are already done.
-        # Simple heuristic: if output_dir provided, look for files that would cover this period.
         if output_dir:
-            # Check for any file that might contain this period
             year_months = set()
             d = current
             while d <= chunk_end:
@@ -251,7 +269,7 @@ def download_historical_chunks(api_key, location, start_date, end_date, chunk_da
             logger.error("    (Will continue with next chunk. You can re-run later to resume.)")
 
         current = chunk_end + timedelta(days=1)
-        time.sleep(0.8)  # be polite
+        time.sleep(sleep_time)
 
     return all_records, last_stations
 
@@ -269,6 +287,12 @@ def main():
     parser.add_argument("--unit-group", default="metric", choices=["us", "uk", "metric", "base"])
     parser.add_argument("--resolution", default="hourly", choices=["hourly", "daily"],
                         help="hourly (default - what you want, but creates big files) or daily (much smaller and faster, good for testing large date ranges first)")
+    parser.add_argument("--plan", default="free", choices=["free", "paid"],
+                        help="Your Visual Crossing plan. Use 'paid' if you have a paid metered subscription. This allows much larger chunks and higher station limits (recommended if you just upgraded).")
+    parser.add_argument("--max-stations", type=int, default=None,
+                        help="ADVANCED: Max number of weather stations to consider (Visual Crossing default is 3). Paid plans allow higher values.")
+    parser.add_argument("--max-distance", type=int, default=None,
+                        help="ADVANCED: Max distance in meters to search for stations (default ~80km). Paid plans allow higher values (e.g. 200000 for 200km).")
     args = parser.parse_args()
 
     api_key = get_api_key()
@@ -281,6 +305,7 @@ def main():
     print(f"Box:          lat {args.lat_min} to {args.lat_max}, lon {args.lon_min} to {args.lon_max}")
     print(f"Date range:   {args.start} to {args.end}")
     print(f"Resolution:   {args.resolution}")
+    print(f"Plan:         {args.plan}")
     print(f"Output folder: {output_dir}")
     print(f"{'='*60}\n")
 
@@ -296,6 +321,8 @@ def main():
             print("!!! BIG WARNING !!!")
             print(f"You asked for {days} days of HOURLY data.")
             print("This can create VERY LARGE files (hundreds of MB or GB).")
+            if args.plan == "paid":
+                print("You are on a paid plan, so you can pull more aggressively.")
             print("The script will chunk it automatically and can resume if stopped.")
             print("If this is your first time, consider a shorter range first (e.g. 1-3 months).")
             print("Waiting 5 seconds before starting... (press Ctrl-C to cancel)")
@@ -306,8 +333,18 @@ def main():
     # 1. Discover stations in/near the box
     center_lat = (args.lat_min + args.lat_max) / 2
     center_lon = (args.lon_min + args.lon_max) / 2
+    # For paid plans we can safely ask for more stations / farther distance
+    if args.plan == "paid":
+        default_max_stations = 50
+        default_max_distance = 200000
+    else:
+        default_max_stations = 30
+        default_max_distance = 150000
+
     stations = discover_stations_in_box(
-        api_key, args.lat_min, args.lat_max, args.lon_min, args.lon_max
+        api_key, args.lat_min, args.lat_max, args.lon_min, args.lon_max,
+        max_distance=args.max_distance or default_max_distance,
+        max_stations=args.max_stations or default_max_stations
     )
 
     if stations:
@@ -339,7 +376,8 @@ def main():
         include=include,
         unit_group=args.unit_group,
         output_dir=output_dir,
-        resolution_label=res_label
+        resolution_label=res_label,
+        is_paid=(args.plan == "paid")
     )
 
     if records:
@@ -382,7 +420,8 @@ def main():
                     include=station_include,
                     unit_group=args.unit_group,
                     output_dir=output_dir,
-                    resolution_label=args.resolution
+                    resolution_label=args.resolution,
+                    is_paid=(args.plan == "paid")
                 )
                 if station_days:
                     sdf = pd.DataFrame(station_days)
@@ -405,6 +444,8 @@ def main():
     print("The per-station files (if any) contain more direct station observations.")
     print("The script is designed to be re-runnable: it will automatically skip chunks whose output files already exist.")
     print("If you had errors or interruptions, just run the exact same command again — it will continue where it left off.")
+    if args.plan == "paid":
+        print("Paid plan detected — using larger chunks for faster downloads.")
 
     # Simple summary file for non-technical users
     try:
@@ -413,6 +454,7 @@ def main():
             f.write(f"Download completed: {datetime.now().isoformat()}\n")
             f.write(f"Box: lat {args.lat_min}-{args.lat_max}, lon {args.lon_min}-{args.lon_max}\n")
             f.write(f"Requested: {args.start} to {args.end} ({args.resolution})\n")
+            f.write(f"Plan: {args.plan}\n")
             f.write(f"Total records downloaded this run: {len(records) if 'records' in locals() else 'N/A'}\n")
             f.write("Files created are safe to open in Excel or Google Sheets.\n")
         print(f"Summary written to {summary_path}")

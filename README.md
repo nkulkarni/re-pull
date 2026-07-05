@@ -225,13 +225,16 @@ It uses the **Visual Crossing** weather API to:
 - Attempt to pull direct historical data from each individual station in the box.
 - Save clean CSVs (stations list + weather records) that you can join to your master listings by proximity or date.
 
+**If you have a paid metered Visual Crossing subscription**, add `--plan paid` to the command. This lets the script use much larger chunks and request data from more stations per call, making big historical pulls significantly faster.
+
 ### Quick start for weather data
-1. Get a free Visual Crossing API key at https://www.visualcrossing.com/ (first 1000 records/day free for commercial use too).
+1. Get a Visual Crossing API key at https://www.visualcrossing.com/.
 2. `export VISUALCROSSING_API_KEY=your_key_here`
 3. Run the demo (uses a southern Ontario box by default):
    ```bash
    python download_weather_box.py --start 2023-01-01 --end 2023-12-31
    ```
+   (Add `--plan paid` if you upgraded.)
 4. Look in the new `weather_data/` folder for:
    - `stations_in_box.csv`
    - `area_weather_*.csv`
