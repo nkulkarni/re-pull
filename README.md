@@ -1,181 +1,251 @@
-# re-pull
+# re-pull: Collect Ontario Farm Listings Easily
 
-Canadian farm listings scraper. Refactored for modularity, resumability, and easy extension to new data sources.
+**What is this tool?**
 
-## Features
+This is a simple computer program that automatically gathers information about farms that are for sale in Ontario from websites like farms.com and farmontario.com.
 
-- **Modular architecture**: Each source lives in `sources/<name>.py` as a subclass of `Scraper`.
-- **Crash-safe checkpointing**: Scraped listings are appended to a JSONL checkpoint immediately. Kill the process at any time and `--fresh` is the only way to start over; normal runs resume automatically.
-- **Normalized output schema**: All sources produce the same `Listing` dataclass → consistent CSVs you can concatenate across sources.
-- **CLI**: Simple `argparse` interface with source selection, page limits, and output directory control.
-- **Polite scraping**: Built-in delays + session reuse.
+It saves all the information into one easy spreadsheet called `master_listings.csv`. You can open this file in Microsoft Excel, Google Sheets, or any spreadsheet program.
 
-## Project layout
+It does useful things automatically:
+- Collects farm details like price, size, location
+- Remembers what it already collected so it doesn't repeat work
+- Adds map coordinates (latitude and longitude) even if the website doesn't show them
+- Calculates "cost per acre" for you
 
-```
-.
-├── run.py                 # CLI entrypoint
-├── sources/
-│   ├── __init__.py
-│   ├── base.py            # Shared Listing dataclass + Scraper ABC + checkpoint logic
-│   └── farmontario.py     # FarmOntarioScraper implementation
-├── farmontario.py         # Original monolithic scraper (kept for reference)
-├── requirements.txt
-├── .gitignore             # Ignores data/, *.csv dumps, venvs, __pycache__, etc.
-└── data/                  # Generated at runtime (gitignored)
-    └── checkpoints/
-```
+**Who is this for?**
 
-## Installation
+Anyone who wants to track farm real estate in Ontario without manually copying information from websites every week. Farmers, real estate agents, researchers, or people interested in land prices.
 
-```bash
-git clone <your-repo-url>
-cd re-pull
-
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
-
-# REQUIRED for the updated V2 scraper (uses Playwright for reliable browser automation)
-playwright install chromium
-# (downloads ~150MB browser binaries; only needs to be done once per machine)
-```
-
-Python 3.10+ recommended (uses modern stdlib features).
-
-## Playwright + Smart Caching (V2 update)
-
-The core `FarmOntarioScraper` (V2) has been refactored to use the **Playwright + BeautifulSoup technique** from `test.py`:
-
-- Uses a real browser (Chromium via Playwright) for detail pages.
-- Automatically handles the "I Accept The Terms" ToS gate + waits for JS/network.
-- Improved lat/lng JSON extraction (stricter regex + cleanup).
-- Falls back gracefully.
-
-**Smart caching** (new in base.py + integrated):
-- Every successfully fetched detail page HTML is saved to `data/cache/<hash>.html`.
-- On future runs, if the URL is in the checkpoint (visited), the scraper loads from cache instead of hitting the network/Playwright (huge speed win + resilience if site is flaky).
-- Cache is per-URL, survives process restarts.
-- `--fresh` now also clears the page cache.
-- `--no-cache` disables it (forces live fetches).
-
-Index page crawling (for discovering links) still uses fast `requests` + BS4. Detail pages use the full Playwright treatment.
-
-## Usage
-
-```bash
-# The engine - one command to rule them all
-python run.py                    # Run ALL sources in smart append mode (only new listings)
-python run.py --fresh            # Full refresh of every source
-
-# Specific sources only
-python run.py farmontario
-python run.py farmscom --max-pages 5
-
-# The master asset (your growing, stable data) is automatically maintained at:
-#   data/master_listings.csv          (and .parquet if pyarrow is installed)
-#
-# It always contains:
-#   - latitude / longitude (empty/NaN where a source couldn't extract them)
-#   - acres + cost_per_acre (computed from size + price where possible)
-
-# Occasional full rebuild of the master from all snapshots (rarely needed)
-python consolidate.py
-
-# Just rebuild the master without scraping
-python run.py --master-only
-
-
-# Limit pages, custom output, force no cache
-python run.py farmontario --max-pages 10 --out-dir data --no-cache
-
-# Full re-pull from scratch (clears checkpoint + page cache)
-python run.py farmontario --fresh
-```
-
-See all options:
-
-```bash
-python run.py --help
-```
-
-Output: a timestamped CSV in the chosen directory, e.g.
-
-```
-data/farmontario_listings_20260703_1422.csv
-```
-
-The CSV will now also include `price_numeric` (parsed from price) when available. More fields (address etc.) can be added by enhancing the BS4 parsing in `sources/farmontario.py`.
-
-## Adding a new source
-
-1. Create `sources/mysource.py`
-2. Subclass `Scraper` from `.base` and implement `crawl(self) -> list[Listing]`.
-3. Use `self.record(listing)` inside your scraper for automatic checkpointing + mid-pull safety.
-4. (Optional but recommended) Use the inherited helpers for smart caching:
-   `content = self._get_cached_content(url)`
-   `self._save_to_cache(url, content)`
-   (see `sources/farmontario.py` for example).
-5. Register it in the `SCRAPERS` dict at the top of `run.py`.
-
-Everything else (CLI, deduping, CSV writing, checkpoint resume, page caching) works automatically.
-
-Example skeleton:
-
-```python
-from .base import Listing, Scraper
-
-class MySourceScraper(Scraper):
-    name = "mysource"
-
-    def crawl(self):
-        # your scraping logic here
-        listing = Listing(title="...", source=self.name)
-        self.record(listing)
-        return self.listings
-```
-
-Then add to `run.py`:
-
-```python
-from sources.mysource import MySourceScraper
-
-SCRAPERS = {
-    "farmontario": FarmOntarioScraper,
-    "mysource": MySourceScraper,
-}
-```
-
-## Data & checkpoints
-
-- All runtime artifacts go under `data/` (completely ignored by git).
-- Checkpoints per source: `data/checkpoints/<source>_checkpoint.jsonl`
-- Page cache: `data/cache/`
-- Per-run snapshots (for auditing): `<source>_listings_YYYYMMDD_HHMM.csv`
-- **Your stable growing data asset**: `data/master_listings.csv` (+ .parquet)
-  - Always has latitude/longitude
-  - Always has acres + cost_per_acre (where computable)
-  - Deduplicated by detail_url across all sources and runs
-  - Append-only by default (the engine only adds what's new)
-
-Never commit scraped data — this repo is for the **scraper code** only.
-
-`--fresh` clears both checkpoint and cache. Use `--no-cache` to bypass the HTML cache for a run.
-
-## License
-
-TBD — add your preferred license when publishing.
-
-## Notes
-
-- The root `farmontario.py` is the original single-file version before the refactor.
-- `farmontario_midcache.py` is a copy of the above (the original was never modified) that back-ports the mid-pull checkpointing technique from V2. It uses the same append-to-JSONL + restore-on-start approach but stays as a single standalone script. Use it with `python farmontario_midcache.py --fresh --max-pages 10`.
-- **V2 is the recommended path**: `python run.py farmontario ...` (now with Playwright details + smart HTML caching).
-- `test.py` is a standalone quick tester for 1-2 specific listing URLs using the same Playwright+BS4 technique (useful for debugging extraction on a problematic URL).
-- Be kind to the sites you scrape (respect robots.txt, use reasonable delays, etc.).
-- This is intended as an internal/research tool.
+**Important notes before starting**
+- This tool visits websites automatically. It is polite (it waits between pages), but please do not run it constantly.
+- The data it collects is for your personal or research use.
+- You need a computer with internet.
 
 ---
 
-Contributions / new sources welcome once the GitHub repo is up!
+## Step-by-Step: Getting Started (No Tech Experience Needed)
+
+### 1. Download the program
+
+1. Go to this GitHub page: https://github.com/nkulkarni/re-pull
+2. Click the green **Code** button (top right)
+3. Click **Download ZIP**
+4. Save the file and unzip it (double-click on most computers)
+5. Rename the unzipped folder to `re-pull` and put it somewhere easy to find (for example, your Desktop)
+
+### 2. Open your command line / terminal
+
+This is where you type instructions to the computer.
+
+- **On Mac**: Press Command + Space, type "Terminal", and open it.
+- **On Windows**: Press the Windows key, type "Command Prompt" or "PowerShell", and open it.
+
+### 3. Go into the re-pull folder
+
+In the terminal, type this and press Enter (change the path if you put the folder somewhere else):
+
+```bash
+cd Desktop/re-pull
+```
+
+(If you're on Windows and used Command Prompt, it might look slightly different, but the idea is the same.)
+
+### 4. Create a safe space for the program (one-time setup)
+
+Type these lines **one at a time** and press Enter after each:
+
+```bash
+python -m venv .venv
+```
+
+```bash
+source .venv/bin/activate
+```
+
+(On Windows it may be: `.venv\Scripts\activate`)
+
+You should see `(.venv)` appear at the start of your command line. This means you're now using a private copy of the tools just for this program.
+
+Next:
+
+```bash
+pip install -r requirements.txt
+```
+
+This downloads everything the program needs. It may take a few minutes.
+
+Then install the browser tool it uses:
+
+```bash
+playwright install chromium
+```
+
+This downloads a special browser (about 150 MB). It only needs to be done once.
+
+### 5. (Optional but recommended) Get map coordinates automatically
+
+Some websites don't include exact map pins. This tool can add them for you using a free service called Geocodio.
+
+1. Go to https://www.geocod.io/
+2. Sign up for a free account (no credit card needed for the free tier).
+3. Copy your API key (it looks like a long string of letters and numbers).
+4. In your terminal, type this (replace `your_key_here` with the actual key):
+
+```bash
+export GEOCODIO_API_KEY=your_key_here
+```
+
+**Do this every time you open a new terminal window**, or ask someone how to make it permanent on your computer.
+
+If you skip this step, the program will still work — it just won't add map coordinates for sources that don't provide them.
+
+### 6. Run the program
+
+To collect the latest farm listings:
+
+```bash
+python run.py
+```
+
+That's it!
+
+- It will automatically visit the websites.
+- It only collects **new** listings it hasn't seen before (smart "append" mode).
+- It updates your master spreadsheet.
+- If you set the Geocodio key, it will add map coordinates where missing.
+
+The first run may take longer because it's being careful and downloading things.
+
+---
+
+## Looking at Your Data
+
+After running, go to the `data` folder inside `re-pull`.
+
+The most important file is:
+
+**`master_listings.csv`**
+
+- Double-click it to open in Excel or upload to Google Sheets.
+- It contains columns like: title, price, acres, cost_per_acre, latitude, longitude, source, etc.
+- `latitude` and `longitude` will have numbers (for mapping) or be blank if not available.
+- `cost_per_acre` is calculated automatically when possible.
+
+There may also be other files like `farmontario_listings_...csv` — these are daily snapshots. The `master_listings.csv` is the one you usually care about.
+
+---
+
+## Updating Your Data Over Time
+
+Just run the same command again:
+
+```bash
+python run.py
+```
+
+It will:
+- Remember what it already has (thanks to checkpoints)
+- Only collect new farms
+- Update the master spreadsheet with any new information
+
+To start completely fresh (get everything again):
+
+```bash
+python run.py --fresh
+```
+
+---
+
+## Geocoding (Adding Map Coordinates)
+
+Some websites show exact map pins on the page. Others don't.
+
+When you provide a Geocodio API key (see step 5 above), the program will automatically look up the address and add latitude + longitude for any listing that is missing them.
+
+- It only does this for new listings that need it.
+- Results are saved forever in a cache file so it doesn't waste your free daily limit.
+- A column called `geocode_provider` will say "geocodio" for any that were added this way.
+
+**Note**: For very rural "Lot and Concession" style addresses common in Ontario, the coordinates will usually point to the general area (township or road) rather than the exact field. This is normal for address-based lookup tools.
+
+---
+
+## Common Questions & Problems
+
+**"Command not found" or "python not recognized"**
+- Make sure you installed Python 3 (download from python.org if needed).
+- Make sure you typed the commands exactly, including the dot in `.venv`.
+
+**The program is slow the first time**
+- Normal. It opens a browser behind the scenes and waits politely between pages. Later runs are much faster because of caching.
+
+**I don't see any coordinates**
+- Did you set the `GEOCODIO_API_KEY`?
+- Some sources simply don't have good location data.
+- Run it again after setting the key.
+
+**I want to stop it**
+- In the terminal, press Control + C (or Command + C on Mac).
+
+**Where is everything stored?**
+- All data goes into the `data` folder. This folder is ignored by git so you don't accidentally upload private farm data.
+
+**Can I run this on a schedule?**
+- Yes, but that's more advanced. You can use your computer's Task Scheduler (Windows) or cron (Mac/Linux).
+
+---
+
+## For People Who Already Know Some Programming
+
+(Everything below this line is technical.)
+
+See the original project structure, source registration in `run.py`, and the `Listing` dataclass in `sources/base.py`.
+
+The engine defaults to running all sources in append mode and maintaining `data/master_listings.csv`.
+
+New sources are added by creating a file in `sources/` and registering it.
+
+---
+
+## Weather Data Integration (New Phase)
+
+We are beginning to enrich the farm listings with historical weather data from nearby weather stations.
+
+A demo script is included: `download_weather_box.py`
+
+It is deliberately written to be as foolproof as possible for non-technical users:
+- You do **not** need to choose chunk sizes — it automatically breaks huge date ranges (even 50+ years of hourly data) into safe API-sized pieces.
+- It is **resumable**: if it gets interrupted or hits a temporary rate limit, just run the exact same command again and it will skip what it already downloaded and continue.
+- Prints very clear warnings and progress messages.
+- At the end it writes a simple `download_summary.txt` in the output folder.
+
+It uses the **Visual Crossing** weather API to:
+- Discover all weather stations inside or near a lat/long bounding box.
+- Download historical observations (hourly by default — use --resolution daily for much smaller/faster results) for the area.
+- Attempt to pull direct historical data from each individual station in the box.
+- Save clean CSVs (stations list + weather records) that you can join to your master listings by proximity or date.
+
+**If you have a paid metered Visual Crossing subscription**, add `--plan paid` to the command. This lets the script use much larger chunks and request data from more stations per call, making big historical pulls significantly faster.
+
+### Quick start for weather data
+1. Get a Visual Crossing API key at https://www.visualcrossing.com/.
+2. `export VISUALCROSSING_API_KEY=your_key_here`
+3. Run the demo (uses a southern Ontario box by default):
+   ```bash
+   python download_weather_box.py --start 2023-01-01 --end 2023-12-31
+   ```
+   (Add `--plan paid` if you upgraded.)
+4. Look in the new `weather_data/` folder for:
+   - `stations_in_box.csv`
+   - `area_weather_*.csv`
+   - Per-station files (where available)
+
+You can change the box with --lat-min / --lat-max / --lon-min / --lon-max and the date range.
+
+**For very small boxes** (e.g. 500m around a specific point), there are often no weather stations exactly inside. If you run the command in a terminal, the script will detect this and interactively ask you something like: "Closest station is 1.7 km away. Use stations up to 2 km outside? [press Enter for 2000m or type a number]". You can also pre-specify with --max-station-distance-from-box 2000 (the value is in meters; 2000 = 2 km). This lets you include the nearest real stations without changing your core box.
+
+Later we will integrate this into the main engine so new farm listings automatically get nearby weather history attached.
+
+This project is intended as a personal/research tool. Be kind to the websites you scrape.
+
+Contributions and new sources are welcome!
